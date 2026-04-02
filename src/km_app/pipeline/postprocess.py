@@ -137,10 +137,11 @@ class KMPipeline:
         print(f"[Binary后处理] 概率图统计: max={prob_map.max():.3f}, min={prob_map.min():.3f}, mean={prob_map.mean():.3f}")
         logger.info(f"[postprocess] 概率图统计: max={prob_map.max():.3f}, min={prob_map.min():.3f}, mean={prob_map.mean():.3f}")
 
-        # 估计曲线数量（仅供参考）
-        estimated_count = estimate_curve_count_from_prob_map(prob_map, min_prob=0.2, min_distance=15)
-        print(f"[Binary后处理] 估计曲线数: {estimated_count}")
-        logger.info(f"[postprocess] 估计曲线数: {estimated_count}")
+        # 估计曲线数量（仅供参考）- 强制限制在1-3
+        estimated_count_raw = estimate_curve_count_from_prob_map(prob_map, min_prob=0.2, min_distance=15)
+        estimated_count = max(1, min(estimated_count_raw, 3))  # 强制限制
+        print(f"[Binary后处理] 估计曲线数: {estimated_count_raw} -> 限制为 {estimated_count}")
+        logger.info(f"[postprocess] 估计曲线数: {estimated_count_raw} -> 限制为 {estimated_count}")
 
         # === 主链：Ridge脊线提取 ===
         logger.info(f"\n[postprocess] === 主链：Ridge脊线提取 ===")
@@ -148,8 +149,8 @@ class KMPipeline:
 
         ridge_paths, ridge_debug = trace_from_prob_map_ridge(
             prob_map,
-            num_curves=max(3, estimated_count),
-            min_prob=0.2
+            num_curves=estimated_count,  # 使用限制后的数量
+            min_prob=0.15  # 从0.2降到0.15
         )
         print(f"[Binary后处理] Ridge主链提取: {len(ridge_paths)} 条路径")
         logger.info(f"[postprocess] Ridge主链提取: {len(ridge_paths)} 条路径")

@@ -10,10 +10,10 @@ logger = logging.getLogger(__name__)
 
 def suppress_horizontal_reference_lines(
     prob_map: np.ndarray,
-    min_horizontal_coverage: float = 0.5,
-    y_std_threshold: float = 5.0,
-    prob_threshold: float = 0.15,
-    decay_factor: float = 0.2
+    min_horizontal_coverage: float = 0.7,  # 从0.5提高到0.7，更严格
+    y_std_threshold: float = 3.0,  # 从5.0降到3.0，更严格
+    prob_threshold: float = 0.20,  # 从0.15提高到0.20
+    decay_factor: float = 0.5  # 从0.2提高到0.5，不要压太狠
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     抑制长水平干扰线（如 50% 参考虚线、x轴等）
@@ -38,6 +38,7 @@ def suppress_horizontal_reference_lines(
     coverage_after = []
 
     logger.info(f"[suppress_horizontal] 开始检测水平参考线...")
+    print(f"[suppress_horizontal] 开始检测水平参考线...")
 
     for y in range(H):
         # 1. 计算该行高概率像素的连续覆盖长度
@@ -126,100 +127,191 @@ def _find_all_start_seeds(prob_map: np.ndarray, used_mask: np.ndarray,
         )
 
         # 对每个峰，记录(col, y, prob)
+        # 只过滤底部5%（X轴区域），保留顶部和中间
+        margin_bottom = int(H * 0.95)
         for peak_idx in peaks:
-            candidates.append((col, peak_idx, col_prob[peak_idx]))
+            if peak_idx < margin_bottom:  # 只过滤底部5%
+                candidates.append((col, peak_idx, col_prob[peak_idx]))
 
     # 按概率倒序排列
     candidates.sort(key=lambda x: x[2], reverse=True)
     return candidates
 
 
+def _extract_column_candidates(prob_map: np.ndarray, used_mask: np.ndarray,
+                               col: int, top_k: int = 5, min_prob: float = 0.05) -> List[Tuple[int, float]]:
+    """
+    从某列提取 top-K 候选点（y坐标，概率）
+
+    Args:
+        prob_map: 概率图
+        used_mask: 已使用mask
+        col: 列索引
+        top_k: 保留前K个候选
+        min_prob: 最小概率阈值
+
+    Returns:
+        [(y1, prob1), (y2, prob2), ...] 按概率降序
+    """
+    H = prob_map.shape[0]
+    col_prob = prob_map[:, col] * (1 - used_mask[:, col].astype(float))
+
+    # 找局部峰值
+    col_smooth = gaussian_filter1d(col_prob, sigma=1.5)
+    peaks, _ = find_peaks(col_smooth, height=min_prob, prominence=0.02, distance=10)  # 降低prominence
+
+    if len(peaks) == 0:
+        # 如果没有峰值，取最大值点
+        max_y = np.argmax(col_prob)
+        if col_prob[max_y] >= min_prob:
+            return [(max_y, col_prob[max_y])]
+        return []
+
+    # 按概率排序，取top-K
+    candidates = [(y, col_prob[y]) for y in peaks]
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    return candidates[:top_k]
+
+
 def _dp_trace_single_path(prob_map: np.ndarray, used_mask: np.ndarray,
                           start_col: int, start_y: int,
                           penalties: Dict[str, float],
-                          max_y_jump: int, width_expand: int) -> Optional[np.ndarray]:
+                          max_y_jump: int, width_expand: int,
+                          timeout_seconds: float = 2.0) -> Optional[np.ndarray]:
     """
-    从(start_col, start_y)出发，向右DP追踪单条路径。
-    返回路径 (N, 2) array [[col1, y1], [col2, y2], ...]
-    如果追踪失败返回None。
+    从(start_col, start_y)出发，向右DP追踪单条路径（候选点DP优化版）
+
+    优化：只在每列的 top-K 候选点之间做转移，而非全像素
+
+    Returns:
+        路径 (N, 2) array [[col1, y1], [col2, y2], ...] 或 None
     """
+    import time
+    start_time = time.time()
+
     H, W = prob_map.shape
-
-    # DP表：dp[y] = 最小成本, prev[y] = 前驱y
     INF = float('inf')
-    dp = [INF] * H
-    prev = [-1] * H
 
-    # 初始化起点
-    dp[start_y] = 0
+    # 候选点DP：dp[(col, y)] = (cost, prev_y)
+    dp = {}
+    dp[(start_col, start_y)] = (0.0, None)
 
-    # 记录每列的DP状态
-    dp_history = [dp.copy()]
-    prev_history = [prev.copy()]
+    # 逐列推进（候选点版本）
+    max_cols = min(W - start_col, width_expand, 800)  # 限制最大宽度
 
-    # 从start_col向右逐列推进
-    for col in range(start_col, min(W, start_col + width_expand)):
-        new_dp = [INF] * H
-        new_prev = [-1] * H
+    successful_cols = 0  # 成功推进的列数
 
-        for y in range(H):
-            if dp[y] == INF:
-                continue
+    for offset in range(max_cols):
+        col = start_col + offset
 
-            # 从(col, y)考虑跳到(col+1, y')
-            for dy in range(-max_y_jump, max_y_jump + 1):
-                y_next = y + dy
-                if not (0 <= y_next < H):
-                    continue
+        # 超时检查
+        if time.time() - start_time > timeout_seconds:
+            logger.warning(f"[DP] 超时 {timeout_seconds}s，提前终止")
+            break
 
-                # 如果下一列超出范围，跳过
-                if col + 1 >= W:
+        if col + 1 >= W:
+            break
+
+        # 获取当前列的所有活跃状态
+        current_states = [(k, v) for k, v in dp.items() if k[0] == col]
+        if not current_states:
+            # 如果当前列没有活跃状态，说明DP断了
+            if offset > 10:  # 至少推进了10列才算有效
+                logger.debug(f"[DP] 在第{offset}列断开，无活跃状态")
+            break
+
+        # 获取下一列的候选点
+        next_candidates = _extract_column_candidates(prob_map, used_mask, col + 1, top_k=5, min_prob=0.05)
+        if not next_candidates:
+            # 如果下一列没有候选，从当前状态延续
+            for (c, y), (cost, _) in current_states:
+                key = (col + 1, y)
+                gap_cost = penalties.get('gap', 0.5)
+                new_cost = cost + gap_cost
+                if key not in dp or new_cost < dp[key][0]:
+                    dp[key] = (new_cost, y)
+            successful_cols += 1
+            continue
+
+        # 对每个当前状态，尝试转移到下一列的候选点
+        transitions_made = 0
+        for (c, y_curr), (cost_curr, _) in current_states:
+            for y_next, prob_next in next_candidates:
+                # 检查跳变是否在允许范围内
+                dy = y_next - y_curr
+                if abs(dy) > max_y_jump:
                     continue
 
                 # 计算代价
-                prob_val = max(prob_map[y_next, col + 1], 0.01)
+                prob_val = max(prob_next, 0.01)
                 prob_cost = -np.log(prob_val) * penalties['low_prob']
-
                 jump_cost = abs(dy) * penalties['jump'] if dy != 0 else 0
-
-                # 水平倾向：if dy==0, 加penalty（KM曲线应该下降）
                 horiz_cost = penalties['horizontal'] if dy == 0 else 0
 
                 # 避开used区域
-                avoid_cost = INF if used_mask[y_next, col + 1] else 0
+                if used_mask[y_next, col + 1]:
+                    continue
 
-                total_cost = dp[y] + prob_cost + jump_cost + horiz_cost + avoid_cost
+                total_cost = cost_curr + prob_cost + jump_cost + horiz_cost
 
-                if total_cost < new_dp[y_next]:
-                    new_dp[y_next] = total_cost
-                    new_prev[y_next] = y
+                key = (col + 1, y_next)
+                if key not in dp or total_cost < dp[key][0]:
+                    dp[key] = (total_cost, y_curr)
+                    transitions_made += 1
 
-        dp = new_dp
-        prev = new_prev
-        dp_history.append(dp.copy())
-        prev_history.append(prev.copy())
+        if transitions_made > 0:
+            successful_cols += 1
 
-    # 回溯找最优终点和路径
-    end_y = min(range(H), key=lambda y: dp[y])
-    if dp[end_y] == INF:
+    logger.debug(f"[DP] 成功推进 {successful_cols}/{max_cols} 列")
+    print(f"  [DP] 成功推进 {successful_cols}/{max_cols} 列, DP表大小={len(dp)}")
+
+    # 回溯找最优终点
+    if not dp:
+        logger.debug(f"[DP] DP表为空，追踪失败")
+        print(f"  [DP] DP表为空，追踪失败")
         return None
 
-    # 反向回溯构建路径
+    last_col = max([k[0] for k in dp.keys()])
+    end_states = [(k, v) for k, v in dp.items() if k[0] == last_col]
+
+    if not end_states:
+        logger.debug(f"[DP] 无终点状态，DP失败 (last_col={last_col}, dp_size={len(dp)})")
+        print(f"  [DP] 无终点状态 (last_col={last_col}, dp_size={len(dp)})")
+        return None
+
+    logger.debug(f"[DP] 找到终点: last_col={last_col}, 候选数={len(end_states)}")
+    print(f"  [DP] 找到终点: last_col={last_col}, 候选数={len(end_states)}")
+
+    # 选择成本最低的终点
+    best_end = min(end_states, key=lambda x: x[1][0])
+    end_col, end_y = best_end[0]
+
+    # 回溯路径
     path = []
-    y = end_y
-    for col_idx in range(len(dp_history) - 1, -1, -1):
-        col = start_col + col_idx
-        if col >= W:
-            continue
+    col, y = end_col, end_y
+
+    while col >= start_col:
         path.append([col, y])
-        if col_idx == 0:
+        if (col, y) not in dp:
             break
-        y = prev_history[col_idx][y]
-        if y == -1:
+        _, prev_y = dp[(col, y)]
+        if prev_y is None:
             break
+        col -= 1
+        y = prev_y
 
     path.reverse()
-    return np.array(path, dtype=np.float32) if len(path) > 0 else None
+
+    logger.debug(f"[DP] 回溯路径长度: {len(path)}, 需要>{max_cols * 0.3:.0f}")
+    print(f"  [DP] 回溯路径长度: {len(path)}, 需要>{max_cols * 0.3:.0f}")
+
+    # 检查路径长度
+    if len(path) < max_cols * 0.3:  # 至少覆盖30%
+        logger.debug(f"[DP] 路径太短: {len(path)} < {max_cols * 0.3:.0f}")
+        print(f"  [DP] 路径太短")
+        return None
+
+    return np.array(path, dtype=np.float32)
 
 
 def _score_path(path: np.ndarray, prob_map: np.ndarray, roi_width: int) -> Tuple[Dict, bool]:
@@ -315,29 +407,28 @@ def trace_from_prob_map_ridge(prob_map: np.ndarray, num_curves: int = 3,
     """
     从概率热图直接提取多条脊线路径，通过逐条提取+带状抑制避免强干扰线压制弱曲线。
 
-    Args:
-        prob_map: 概率图 [H, W], float32 [0,1]
-        num_curves: 期望提取的曲线数量
-        min_prob: 最小概率阈值
-        min_distance: 曲线间最小距离
-
-    Returns:
-        (extracted_paths, debug_info)
-        - extracted_paths: 路径列表
-        - debug_info: 调试信息字典
+    优化版：候选点DP + 曲线数限制 + 超时保护
     """
     H, W = prob_map.shape
-    logger.info(f"\n[fallback_trace] 开始Ridge脊线提取...")
+    print(f"\n[fallback_trace] 开始Ridge脊线提取（优化版）...")
+    print(f"[fallback_trace] 概率图尺寸: {W}x{H}")
+    logger.info(f"\n[fallback_trace] 开始Ridge脊线提取（优化版）...")
     logger.info(f"[fallback_trace] 概率图尺寸: {W}x{H}")
 
+    # 强制限制曲线数（防止过度提取）
+    num_curves = max(1, min(num_curves, 3))
+    print(f"[fallback_trace] 限制最大曲线数: {num_curves}")
+    logger.info(f"[fallback_trace] 限制最大曲线数: {num_curves}")
+
     # 第1步：水平参考线抑制
+    print(f"[fallback_trace] 开始水平线抑制...")
     suppressed_prob_map, suppression_mask = suppress_horizontal_reference_lines(prob_map)
+    print(f"[fallback_trace] 水平线抑制完成")
 
     # 第2步：初始化
     extracted_paths = []
     used_mask = np.zeros_like(prob_map, dtype=bool)
 
-    # 调试日志初始化
     debug_log = {
         'suppression': {
             'rows_suppressed': np.where(suppression_mask.any(axis=1))[0].tolist(),
@@ -349,10 +440,10 @@ def trace_from_prob_map_ridge(prob_map: np.ndarray, num_curves: int = 3,
 
     # 第3步：逐条提取路径
     for round_idx in range(num_curves):
-        logger.info(f"\n[fallback_trace] === Ridge extraction round {round_idx + 1} ===")
+        logger.info(f"\n[fallback_trace] === Ridge extraction round {round_idx + 1}/{num_curves} ===")
 
-        # 3.1 在左侧15%宽度范围内寻找所有候选起点
-        left_width = max(int(W * 0.15), 20)
+        # 3.1 在左侧10%宽度范围内寻找候选起点（缩小搜索范围）
+        left_width = max(int(W * 0.10), 15)
         candidates = _find_all_start_seeds(
             prob_map=suppressed_prob_map,
             used_mask=used_mask,
@@ -362,8 +453,8 @@ def trace_from_prob_map_ridge(prob_map: np.ndarray, num_curves: int = 3,
         )
 
         if not candidates or candidates[0][2] < min_prob:
-            # 没有足够好的候选，停止
             logger.info(f"[fallback_trace] 无足够候选起点，停止提取")
+            print(f"[fallback_trace] Round {round_idx+1}: 无足够候选 (candidates={len(candidates) if candidates else 0}, best_prob={candidates[0][2] if candidates else 0:.3f}, min_prob={min_prob})")
             break
 
         # 3.2 选择最强候选
@@ -378,33 +469,52 @@ def trace_from_prob_map_ridge(prob_map: np.ndarray, num_curves: int = 3,
         }
 
         logger.info(f"[fallback_trace] 起点: col={best_col}, y={best_y}, prob={best_prob:.3f}")
-        logger.info(f"[fallback_trace] 候选数: {len(candidates)}")
+        print(f"[fallback_trace] Round {round_idx+1}: 起点 col={best_col}, y={best_y}, prob={best_prob:.3f}, 候选数={len(candidates)}")
 
-        # 3.3 从起点出发，DP追踪单条路径
+        # 3.3 DP追踪（优化版：候选点DP + 超时保护）
         path = _dp_trace_single_path(
             prob_map=suppressed_prob_map,
             used_mask=used_mask,
             start_col=best_col,
             start_y=best_y,
             penalties={
-                'low_prob': 1.0,      # 低概率代价
-                'jump': 0.05,         # 上下跳跃代价（降低以允许KM台阶）
-                'horizontal': 0.5,    # 水平倾向代价（降低）
-                'gap': 0.5            # 缺失像素代价
+                'low_prob': 1.0,
+                'jump': 0.05,
+                'horizontal': 0.5,
+                'gap': 0.5
             },
-            max_y_jump=30,
-            width_expand=W
+            max_y_jump=15,  # 从30降到15
+            width_expand=W,
+            timeout_seconds=2.0  # 单条路径最多2秒
         )
 
-        if path is None or len(path) < W * 0.35:
-            # 路径太短或追踪失败，跳过
+        if path is None or len(path) < W * 0.30:  # 降低到30%
             logger.info(f"[fallback_trace] 路径追踪失败或太短")
+            print(f"[fallback_trace] Round {round_idx+1}: 路径失败 (path={'None' if path is None else len(path)}, 需要>{W*0.30:.0f})")
+
+            # 打印DP调试信息（从logger获取）
+            import logging
+            for handler in logger.handlers:
+                if hasattr(handler, 'buffer'):
+                    for record in handler.buffer[-5:]:  # 最后5条日志
+                        if '[DP]' in record.getMessage():
+                            print(f"  DEBUG: {record.getMessage()}")
+
             round_log['status'] = 'failed_too_short'
             round_log['path_length'] = 0 if path is None else len(path)
             debug_log['rounds'].append(round_log)
+
+            # 抑制失败的起点，避免重复尝试
+            y_min = max(0, best_y - 20)
+            y_max = min(H, best_y + 20)
+            x_min = max(0, best_col - 10)
+            x_max = min(W, best_col + 10)
+            used_mask[y_min:y_max, x_min:x_max] = True
+            print(f"[fallback_trace] Round {round_idx+1}: 抑制失败起点 ({best_col}, {best_y})")
+
             continue
 
-        # 3.4 对路径进行质量评分
+        # 3.4 质量评分
         score_dict, is_valid = _score_path(path, suppressed_prob_map, W)
         round_log.update({
             'path_length': len(path),
@@ -417,49 +527,44 @@ def trace_from_prob_map_ridge(prob_map: np.ndarray, num_curves: int = 3,
             'score': float(score_dict.get('final_score', 0))
         })
 
-        logger.info(f"[fallback_trace] 路径长度: {len(path)} 像素")
-        logger.info(f"[fallback_trace] 宽度覆盖: {score_dict['width_coverage']:.1%}")
-        logger.info(f"[fallback_trace] 平均概率: {score_dict['avg_prob']:.3f}")
-        logger.info(f"[fallback_trace] Y范围: {score_dict['y_range']:.1f} 像素")
-        logger.info(f"[fallback_trace] 水平比例: {score_dict['horizontal_ratio']:.1%}")
+        logger.info(f"[fallback_trace] 路径: 长度={len(path)}, 覆盖={score_dict['width_coverage']:.1%}, "
+                   f"概率={score_dict['avg_prob']:.3f}, 质量={'PASS' if is_valid else 'FAIL'}")
+        print(f"[fallback_trace] Round {round_idx+1}: 长度={len(path)}, 覆盖={score_dict['width_coverage']:.1%}, "
+              f"概率={score_dict['avg_prob']:.3f}, y_range={score_dict['y_range']:.0f}, "
+              f"horiz={score_dict['horizontal_ratio']:.1%}, 质量={'PASS' if is_valid else 'FAIL'}")
 
         if not is_valid:
-            logger.info(f"[fallback_trace] 质量检查: FAIL")
             round_log['status'] = 'failed_quality_check'
             debug_log['rounds'].append(round_log)
+            print(f"[fallback_trace] Round {round_idx+1}: 质量检查失败")
             continue
 
-        logger.info(f"[fallback_trace] 质量检查: PASS")
-
-        # 3.5 检查与已提路径的最小间距
+        # 3.5 间距检查
         min_dist_to_others = float('inf')
         for prev_path in extracted_paths:
             dist = _min_distance_between_paths(path, prev_path)
             min_dist_to_others = min(min_dist_to_others, dist)
 
         if extracted_paths and min_dist_to_others < min_distance:
-            logger.info(f"[fallback_trace] 与已有路径距离: {min_dist_to_others:.1f} < {min_distance}, 太近，丢弃")
+            logger.info(f"[fallback_trace] 距离={min_dist_to_others:.1f} < {min_distance}, 太近")
+            print(f"[fallback_trace] Round {round_idx+1}: 距离太近 ({min_dist_to_others:.1f} < {min_distance})")
             round_log['status'] = 'failed_too_close'
             round_log['min_dist_to_others'] = float(min_dist_to_others)
             debug_log['rounds'].append(round_log)
             continue
 
-        # 3.6 通过所有检查，加入结果
+        # 3.6 接受路径
         extracted_paths.append(path)
         round_log['status'] = 'accepted'
         debug_log['rounds'].append(round_log)
         logger.info(f"[fallback_trace] 状态: ACCEPTED ✓")
+        print(f"[fallback_trace] Round {round_idx+1}: ACCEPTED ✓")
 
-        # 3.7 在used_mask中做带状抑制，为下一轮腾出空间
+        # 3.7 带状抑制
         _suppress_around_path(used_mask, path, radius=15)
 
-    # 调试输出
     logger.info(f"\n[fallback_trace] ✓ Ridge提取完成: {len(extracted_paths)} 条路径")
-    for log in debug_log['rounds']:
-        logger.info(f"  Round {log['round']}: {log['status']}, "
-                   f"start=({log['start_col']},{log['start_y']}), "
-                   f"coverage={log.get('width_coverage', 'N/A'):.2%}, "
-                   f"avg_prob={log.get('avg_prob', 'N/A'):.3f}")
+    print(f"[fallback_trace] ✓ 最终提取: {len(extracted_paths)} 条路径")
 
     return extracted_paths, {
         'suppressed_prob_map': suppressed_prob_map,
