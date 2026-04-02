@@ -1,0 +1,41 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Outputs
+outputs/
+*.png
+*.csv
+*.txt
+
+# Training artifacts
+models/debug/
+models/checkpoint_epoch_*.pth
+models/best_model.pth
+models/best_model_new.pth
+
+# Training data debug
+training_data/debug_vis/
+training_data/masks_vis/
+
+# Temporary files
+*.log
+*.tmp
+*.zip
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+models/*.pth
+
+models/*.pth
