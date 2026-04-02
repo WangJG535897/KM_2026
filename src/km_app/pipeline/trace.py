@@ -1,4 +1,11 @@
-"""曲线路径追踪 - 增强版"""
+"""曲线路径追踪 - 增强版
+
+路径平滑说明：
+  KM曲线（Kaplan-Meier estimator）具有阶梯状特征，反映离散的事件发生时间点。
+  强行使用移动平均等平滑会抹掉真实的event发生点，导致数据失真。
+  因此默认 enable_smooth=False，保留step-like结构。
+  用户可在后期处理中按需应用轻量平滑。
+"""
 import numpy as np
 import cv2
 from typing import List, Tuple, Optional

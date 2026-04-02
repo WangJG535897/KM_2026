@@ -95,8 +95,12 @@ def _score_binary_candidate(mask: np.ndarray, prob_map: np.ndarray) -> float:
     elif comp_info['elongated_count'] > 3:
         score += 10.0  # 太多组件，部分奖励
 
-    # 惩罚：fg_ratio过大（大白板）
-    if fg_ratio > 0.20:
+    # 惩罚：fg_ratio过大（大白板）- 加强惩罚
+    if fg_ratio > 0.60:
+        score *= 0.2  # 极度降分，基本不选
+    elif fg_ratio > 0.30:
+        score *= 0.7  # 大幅降分
+    elif fg_ratio > 0.20:
         score -= (fg_ratio - 0.20) * 50.0
 
     # 惩罚：超大单块
@@ -152,8 +156,17 @@ def process_binary_segmentation(pred_result: dict, image: np.ndarray,
     # 选择最高分候选
     best_candidate = max(candidates, key=lambda x: x['score'])
 
+    # 确定置信度
+    fg_ratio = best_candidate['fg_ratio']
+    if fg_ratio < 0.2:
+        confidence = 'high'
+    elif fg_ratio < 0.4:
+        confidence = 'medium'
+    else:
+        confidence = 'low'
+
     print(f"[Segmentation] ✓ 选择阈值{best_candidate['threshold']:.2f} "
-          f"(score={best_candidate['score']:.1f})\n")
+          f"(score={best_candidate['score']:.1f}, confidence={confidence})\n")
 
     return {
         'mode': 'binary',
@@ -162,7 +175,10 @@ def process_binary_segmentation(pred_result: dict, image: np.ndarray,
         'best_threshold': best_candidate['threshold'],
         'best_score': best_candidate['score'],
         'candidates': candidates,
-        'fg_ratio': best_candidate['fg_ratio']
+        'fg_ratio': best_candidate['fg_ratio'],
+        'confidence': confidence,  # 新增
+        'num_components': best_candidate['num_components'],  # 新增
+        'horizontal_coverage': best_candidate['horizontal_coverage']  # 新增
     }
 
 

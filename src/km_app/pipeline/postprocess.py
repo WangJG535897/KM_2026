@@ -124,26 +124,45 @@ class KMPipeline:
 
     def _process_binary(self, original_image: np.ndarray, roi_image: np.ndarray,
                        pred_result: dict, roi: Tuple) -> Dict:
-        """二分类模型处理流程 - 增强版with fallback"""
-        print(f"\n[Binary后处理] 开始处理...")
+        """二分类模型处理流程 - Ridge主链优先"""
+        import logging
+        logger = logging.getLogger(__name__)
 
-        # 2. 处理分割结果
-        seg_result = process_binary_segmentation(pred_result, roi_image)
-        prob_map = seg_result['prob_map']
-        binary_mask = seg_result['binary_mask']
+        print(f"\n[Binary后处理] 开始处理...")
+        logger.info(f"\n[postprocess] === 二分类后处理开始 ===")
+
+        # 2. 获取概率图
+        prob_map = pred_result['prob_map']
 
         print(f"[Binary后处理] 概率图统计: max={prob_map.max():.3f}, min={prob_map.min():.3f}, mean={prob_map.mean():.3f}")
-        print(f"[Binary后处理] 最佳阈值: {seg_result['best_threshold']}, 前景占比: {seg_result['fg_ratio']:.4f}")
+        logger.info(f"[postprocess] 概率图统计: max={prob_map.max():.3f}, min={prob_map.min():.3f}, mean={prob_map.mean():.3f}")
 
-        # 打印所有候选阈值的统计
-        for cand in seg_result['candidates']:
-            print(f"  阈值{cand['threshold']}: fg_pixels={cand['fg_pixels']}, fg_ratio={cand['fg_ratio']:.4f}")
-
-        # 估计曲线数量
+        # 估计曲线数量（仅供参考）
         estimated_count = estimate_curve_count_from_prob_map(prob_map, min_prob=0.2, min_distance=15)
         print(f"[Binary后处理] 估计曲线数: {estimated_count}")
+        logger.info(f"[postprocess] 估计曲线数: {estimated_count}")
 
-        # 3. 形状过滤
+        # === 主链：Ridge脊线提取 ===
+        logger.info(f"\n[postprocess] === 主链：Ridge脊线提取 ===")
+        from .fallback_trace import trace_from_prob_map_ridge
+
+        ridge_paths, ridge_debug = trace_from_prob_map_ridge(
+            prob_map,
+            num_curves=max(3, estimated_count),
+            min_prob=0.2
+        )
+        print(f"[Binary后处理] Ridge主链提取: {len(ridge_paths)} 条路径")
+        logger.info(f"[postprocess] Ridge主链提取: {len(ridge_paths)} 条路径")
+
+        # === 辅助链：Binary分割追踪（降级为参考） ===
+        logger.info(f"\n[postprocess] === 辅助链：Binary分割追踪 ===")
+        seg_result = process_binary_segmentation(pred_result, roi_image)
+        binary_mask = seg_result['binary_mask']
+
+        print(f"[Binary后处理] 最佳阈值: {seg_result['best_threshold']}, 前景占比: {seg_result['fg_ratio']:.4f}")
+        logger.info(f"[postprocess] Binary阈值: {seg_result['best_threshold']}, fg_ratio: {seg_result['fg_ratio']:.4f}")
+
+        # 形状过滤
         component_masks = filter_components_by_shape(binary_mask, min_area=300, min_width=50, prob_map=prob_map)
         print(f"[Binary后处理] 形状过滤: 保留 {len(component_masks)} 个组件")
 
@@ -153,85 +172,88 @@ class KMPipeline:
             component_masks = filter_components_by_shape(fallback_mask, min_area=200, min_width=40, prob_map=prob_map)
             print(f"[Binary后处理] 降低阈值后: 保留 {len(component_masks)} 个组件")
 
-        # 4. 提取skeleton
+        # 提取skeleton
         skeletons = []
         for i, mask in enumerate(component_masks):
             skeleton = extract_skeleton_from_mask(mask)
             skeleton_pixels = np.sum(skeleton > 0)
-            print(f"[Binary后处理] 组件{i+1} skeleton像素数: {skeleton_pixels}")
             if skeleton_pixels > 0:
                 skeletons.append(skeleton)
 
-        print(f"[Binary后处理] 有效skeleton数量: {len(skeletons)}")
-
-        # 5. 分离多条曲线（如果有重叠）
+        # 分离多条曲线
         separated_masks = []
         for skeleton in skeletons:
             curves = separate_curves_by_connectivity(skeleton, min_size=100)
             separated_masks.extend(curves)
 
-        print(f"[Binary后处理] 连通域分离后: {len(separated_masks)} 个mask")
-
-        # 6. 路径追踪（ROI局部坐标）- 不启用平滑以保留KM台阶
-        traced_paths_roi = trace_multiple_curves(separated_masks, enable_smooth=False)
-        print(f"[Binary后处理] 常规追踪得到: {len(traced_paths_roi)} 条路径")
+        # 路径追踪
+        regular_paths = trace_multiple_curves(separated_masks, enable_smooth=False)
+        print(f"[Binary后处理] Regular辅助链: {len(regular_paths)} 条路径")
+        logger.info(f"[postprocess] Regular辅助链: {len(regular_paths)} 条路径")
 
         # 检查路径覆盖率
         h, w = prob_map.shape
-        valid_paths = []
-        for path in traced_paths_roi:
+        valid_regular_paths = []
+        for path in regular_paths:
             coverage = len(path) / w
             if coverage >= 0.35:
-                valid_paths.append(path)
-            else:
-                print(f"[Binary后处理] 路径覆盖率{coverage:.1%}太低，丢弃")
+                valid_regular_paths.append(path)
 
-        traced_paths_roi = valid_paths
-        print(f"[Binary后处理] 覆盖率过滤后: {len(traced_paths_roi)} 条路径")
+        regular_paths = valid_regular_paths
+        print(f"[Binary后处理] Regular覆盖率过滤后: {len(regular_paths)} 条路径")
+        logger.info(f"[postprocess] Regular覆盖率过滤后: {len(regular_paths)} 条路径")
 
-        # 7. 决策是否启用fallback
+        # === 融合决策 ===
+        logger.info(f"\n[postprocess] === 融合决策 ===")
+        selected_method = 'ridge_primary'
+        final_paths = ridge_paths
         fallback_triggered = False
-        selected_method = "regular"
 
-        # 触发条件：
-        # 1. 常规流程得到0条路径
-        # 2. 或者路径数量明显少于估计数量（且估计数>=2）
-        should_fallback = (
-            len(traced_paths_roi) == 0 or
-            (estimated_count >= 2 and len(traced_paths_roi) < estimated_count - 1)
-        )
-
-        if should_fallback:
-            print(f"[Binary后处理] ⚠️ 触发fallback (常规={len(traced_paths_roi)}, 估计={estimated_count})")
-            from .fallback_trace import trace_from_prob_map_ridge
-
-            fallback_paths = trace_from_prob_map_ridge(prob_map, num_curves=max(3, estimated_count), min_prob=0.2)
-            print(f"[Binary后处理] Fallback提取到: {len(fallback_paths)} 条路径")
-
-            if len(fallback_paths) > len(traced_paths_roi):
-                # Fallback更好，使用fallback结果
-                traced_paths_roi = fallback_paths
-                fallback_triggered = True
-                selected_method = "fallback"
-                print(f"[Binary后处理] ✓ 使用fallback结果")
-            elif len(traced_paths_roi) > 0:
-                # 常规流程有结果，保留常规
-                print(f"[Binary后处理] ✓ 保留常规结果")
+        # 仅当ridge提取结果质量太差时，考虑fallback到regular
+        if len(ridge_paths) == 0 and len(regular_paths) > 0:
+            selected_method = 'regular_fallback'
+            final_paths = regular_paths
+            fallback_triggered = True
+            logger.info(f"[postprocess] Ridge失败，使用Regular fallback")
+            print(f"[Binary后处理] Ridge失败，使用Regular fallback")
+        elif len(ridge_paths) == 1 and len(regular_paths) >= 2:
+            # Hybrid：如果ridge只提1条但regular提2条，考虑合并
+            # 检查regular路径质量
+            from .fallback_trace import _score_path
+            all_valid = all(_score_path(p, prob_map, w)[1] for p in regular_paths)
+            if all_valid:
+                selected_method = 'hybrid'
+                final_paths = ridge_paths + regular_paths
+                logger.info(f"[postprocess] Hybrid模式：Ridge {len(ridge_paths)} + Regular {len(regular_paths)}")
+                print(f"[Binary后处理] Hybrid模式：Ridge {len(ridge_paths)} + Regular {len(regular_paths)}")
             else:
-                # 都失败了，至少用fallback
-                traced_paths_roi = fallback_paths
-                fallback_triggered = True
-                selected_method = "fallback"
-                print(f"[Binary后处理] ✓ 使用fallback结果（常规失败）")
+                logger.info(f"[postprocess] 使用Ridge primary（Regular质量不足）")
+                print(f"[Binary后处理] 使用Ridge primary（Regular质量不足）")
+        else:
+            logger.info(f"[postprocess] 使用Ridge primary")
+            print(f"[Binary后处理] 使用Ridge primary")
 
-        # 8. 应用KM约束
-        constrained_paths_roi = apply_km_constraints_batch(traced_paths_roi)
+        logger.info(f"[postprocess] 最终方法: {selected_method}")
+        logger.info(f"[postprocess] 最终曲线数: {len(final_paths)}")
+        print(f"[Binary后处理] 最终方法: {selected_method}, 曲线数: {len(final_paths)}")
+
+        # 失败诊断
+        if len(final_paths) == 0:
+            logger.warning(f"[postprocess] ALERT: 未检测到曲线!")
+            logger.warning(f"  Ridge失败原因: {len(ridge_paths)} 条路径")
+            logger.warning(f"  Regular失败原因: {len(regular_paths)} 条路径")
+            logger.warning(f"  建议检查: prob_map统计、水平线抑制、起点检测")
+            print(f"[Binary后处理] ⚠️ ALERT: 未检测到曲线!")
+
+        # 应用KM约束
+        constrained_paths_roi = apply_km_constraints_batch(final_paths)
         print(f"[Binary后处理] KM约束后: {len(constrained_paths_roi)} 条路径")
+        logger.info(f"[postprocess] KM约束后: {len(constrained_paths_roi)} 条路径")
 
-        # 9. 转换为全图坐标
+        # 转换为全图坐标
         constrained_paths_global = convert_roi_paths_to_global(constrained_paths_roi, roi)
 
-        # 10. 坐标映射（基于ROI局部坐标）
+        # 坐标映射（基于ROI局部坐标）
         x1, y1, x2, y2 = roi
         self.mapper = CoordinateMapper(
             roi=(0, 0, x2 - x1, y2 - y1),
@@ -247,6 +269,39 @@ class KMPipeline:
             combined_skeleton = np.maximum(combined_skeleton, sk)
 
         print(f"[Binary后处理] ✓ 最终提取: {len(chart_coords)} 条曲线 (方法: {selected_method})\n")
+        logger.info(f"[postprocess] ✓ 完成，最终提取: {len(chart_coords)} 条曲线\n")
+
+        # 保存调试图像
+        from pathlib import Path
+        output_dir = Path(__file__).parent.parent.parent.parent / "outputs"
+        output_dir.mkdir(exist_ok=True)
+
+        # 保存Ridge调试图像
+        if ridge_debug:
+            import cv2
+            # 保存抑制后的概率图
+            suppressed_vis = (ridge_debug['suppressed_prob_map'] * 255).astype(np.uint8)
+            cv2.imwrite(str(output_dir / "prob_map_suppressed.png"), suppressed_vis)
+
+            # 保存水平线抑制mask
+            suppression_vis = (ridge_debug['suppression_mask'] * 255).astype(np.uint8)
+            cv2.imwrite(str(output_dir / "horizontal_suppression_mask.png"), suppression_vis)
+
+            # 保存Ridge路径可视化
+            ridge_paths_vis = cv2.cvtColor(suppressed_vis, cv2.COLOR_GRAY2BGR)
+            colors = [(0, 255, 0), (255, 0, 0), (0, 0, 255), (255, 255, 0)]
+            for idx, path in enumerate(ridge_paths):
+                color = colors[idx % len(colors)]
+                path_int = path.astype(int)
+                for i in range(len(path_int) - 1):
+                    pt1 = tuple(path_int[i])
+                    pt2 = tuple(path_int[i + 1])
+                    cv2.line(ridge_paths_vis, pt1, pt2, color, 2)
+                # 标记起点
+                cv2.circle(ridge_paths_vis, tuple(path_int[0]), 5, (255, 255, 255), -1)
+            cv2.imwrite(str(output_dir / "ridge_paths.png"), ridge_paths_vis)
+
+            logger.info(f"[postprocess] 调试图像已保存到 {output_dir}")
 
         return {
             'mode': 'binary',
@@ -265,9 +320,12 @@ class KMPipeline:
             'chart_coords': chart_coords,
             'num_curves': len(chart_coords),
             'fg_ratio': seg_result['fg_ratio'],
-            'estimated_curve_count': estimated_count,
+            'estimated_curve_count': len(final_paths),  # 使用实际提取数
             'fallback_triggered': fallback_triggered,
-            'selected_method': selected_method
+            'selected_method': selected_method,
+            'ridge_debug': ridge_debug,  # 新增：Ridge调试信息
+            'ridge_paths_count': len(ridge_paths),  # 新增
+            'regular_paths_count': len(regular_paths)  # 新增
         }
 
     def _process_multiclass(self, original_image: np.ndarray, roi_image: np.ndarray,
