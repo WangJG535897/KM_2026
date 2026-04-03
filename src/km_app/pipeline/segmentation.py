@@ -96,10 +96,12 @@ def _score_binary_candidate(mask: np.ndarray, prob_map: np.ndarray) -> float:
         score += 10.0  # 太多组件，部分奖励
 
     # 惩罚：fg_ratio过大（大白板）- 加强惩罚
-    if fg_ratio > 0.60:
-        score *= 0.2  # 极度降分，基本不选
+    if fg_ratio > 0.70:
+        score *= 0.1  # 极度降分，基本不选
+    elif fg_ratio > 0.50:
+        score *= 0.3  # 大幅降分
     elif fg_ratio > 0.30:
-        score *= 0.7  # 大幅降分
+        score *= 0.7  # 中度降分
     elif fg_ratio > 0.20:
         score -= (fg_ratio - 0.20) * 50.0
 
@@ -204,7 +206,7 @@ def process_multiclass_segmentation(pred_result: dict, image: np.ndarray) -> dic
 
 def filter_components_by_shape(mask: np.ndarray, min_area=100, min_width=50,
                                prob_map: np.ndarray = None) -> List[np.ndarray]:
-    """根据形状特征过滤连通域 - 增强版
+    """根据形状特征过滤连通域 - 放宽版
 
     Args:
         mask: 二值mask
@@ -236,8 +238,8 @@ def filter_components_by_shape(mask: np.ndarray, min_area=100, min_width=50,
         if cw < min_width:
             continue
 
-        # KM曲线特征：横向延展长、细
-        if aspect_ratio < 2.0:
+        # KM曲线特征：横向延展长、细 - 放宽要求
+        if aspect_ratio < 1.5:  # 从2.0降到1.5
             continue
 
         # Skeleton长度
@@ -262,16 +264,16 @@ def filter_components_by_shape(mask: np.ndarray, min_area=100, min_width=50,
             if len(component_probs) > 0:
                 avg_prob = np.mean(component_probs)
 
-        # 综合判断
+        # 综合判断 - 放宽要求
         is_valid = (
-            aspect_ratio >= 2.0 and
+            aspect_ratio >= 1.5 and  # 从2.0降到1.5
             cw >= min_width and
-            skeleton_len > 50 and
-            h_coverage > 0.1
+            skeleton_len > 30 and  # 从50降到30
+            h_coverage > 0.05  # 从0.1降到0.05
         )
 
-        # 如果有概率图，额外要求平均概率>0.15
-        if prob_map is not None and avg_prob < 0.15:
+        # 如果有概率图，额外要求平均概率>0.12（从0.15降到0.12）
+        if prob_map is not None and avg_prob < 0.12:
             is_valid = False
 
         if is_valid:

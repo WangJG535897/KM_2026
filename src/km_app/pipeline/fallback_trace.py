@@ -109,9 +109,17 @@ def _find_all_start_seeds(prob_map: np.ndarray, used_mask: np.ndarray,
     """
     在左侧left_width宽度范围内，找所有候选起点(col, y, prob)
     返回按概率倒序的列表：[(col1, y1, prob1), (col2, y2, prob2), ...]
+
+    改进：
+    1. 过滤顶部和底部边界区域
+    2. 增加"向右支撑"检查，避免孤立峰值
     """
     H, W = prob_map.shape
     candidates = []
+
+    # 边界屏蔽：顶部10%和底部5%
+    margin_top = int(H * 0.10)
+    margin_bottom = int(H * 0.95)
 
     # 对左侧每一列
     for col in range(min(left_width, W)):
@@ -127,14 +135,35 @@ def _find_all_start_seeds(prob_map: np.ndarray, used_mask: np.ndarray,
         )
 
         # 对每个峰，记录(col, y, prob)
-        # 只过滤底部5%（X轴区域），保留顶部和中间
-        margin_bottom = int(H * 0.95)
         for peak_idx in peaks:
-            if peak_idx < margin_bottom:  # 只过滤底部5%
+            # 过滤顶部和底部边界
+            if peak_idx < margin_top or peak_idx >= margin_bottom:
+                continue
+
+            # 向右支撑检查：检查右侧5列是否有持续支撑
+            right_support_count = 0
+            for offset in range(1, min(6, W - col)):
+                right_col = col + offset
+                if right_col >= W:
+                    break
+                # 检查右侧列在该y附近是否有高概率
+                y_min = max(0, peak_idx - 10)
+                y_max = min(H, peak_idx + 10)
+                right_region = prob_map[y_min:y_max, right_col]
+                if right_region.max() > min_prob * 0.5:  # 右侧支撑阈值降低50%
+                    right_support_count += 1
+
+            # 要求至少3列有支撑
+            if right_support_count >= 3:
                 candidates.append((col, peak_idx, col_prob[peak_idx]))
 
     # 按概率倒序排列
     candidates.sort(key=lambda x: x[2], reverse=True)
+
+    print(f"[起点过滤] 原始峰值: {len(peaks) if 'peaks' in locals() else 'N/A'}, "
+          f"边界过滤后: {len([c for c in candidates if margin_top <= c[1] < margin_bottom])}, "
+          f"支撑检查后: {len(candidates)}")
+
     return candidates
 
 
@@ -316,7 +345,7 @@ def _dp_trace_single_path(prob_map: np.ndarray, used_mask: np.ndarray,
 
 def _score_path(path: np.ndarray, prob_map: np.ndarray, roi_width: int) -> Tuple[Dict, bool]:
     """
-    对路径进行多维度评分。
+    对路径进行多维度评分（KM-aware版本）。
     返回 (score_dict, is_valid_bool)
     """
     if len(path) == 0:
@@ -339,32 +368,51 @@ def _score_path(path: np.ndarray, prob_map: np.ndarray, roi_width: int) -> Tuple
     y_range = path[:, 1].max() - path[:, 1].min()
     y_std = np.std(path[:, 1])
 
-    # 检查是否几乎完全水平（坏特征）
+    # KM曲线特征分析
     dy_list = np.diff(path[:, 1])
-    horizontal_count = np.sum(np.abs(dy_list) < 0.5)
-    horizontal_ratio = horizontal_count / len(dy_list) if len(dy_list) > 0 else 0
+
+    # 1. 平坦段（KM曲线正常特征）
+    flat_count = np.sum(np.abs(dy_list) < 0.5)
+    flat_ratio = flat_count / len(dy_list) if len(dy_list) > 0 else 0
+
+    # 2. 反向上升（KM曲线异常特征）
+    upward_count = np.sum(dy_list < -1.0)  # y向下为正，向上为负
+    upward_ratio = upward_count / len(dy_list) if len(dy_list) > 0 else 0
+
+    # 3. 异常大跳变（可能是噪声）
+    big_jump_count = np.sum(np.abs(dy_list) > 10)
+    big_jump_ratio = big_jump_count / len(dy_list) if len(dy_list) > 0 else 0
 
     score_dict = {
         'width_coverage': width_coverage,
         'avg_prob': avg_prob,
         'y_range': y_range,
         'y_std': y_std,
-        'horizontal_ratio': horizontal_ratio,
+        'flat_ratio': flat_ratio,
+        'upward_ratio': upward_ratio,
+        'big_jump_ratio': big_jump_ratio,
         'path_length': len(path)
     }
 
-    # 质量检查
+    # KM-aware质量检查：
+    # - 主要惩罚：反向上升、异常跳变
+    # - 允许：高平坦比例（KM曲线正常特征）
     is_valid = (
-        width_coverage >= 0.35 and          # 覆盖至少35%宽度
+        width_coverage >= 0.25 and          # 覆盖至少25%宽度（放宽）
         avg_prob >= 0.15 and               # 平均概率足够
         y_range >= 5 and                   # Y方向不能完全水平
-        horizontal_ratio < 0.80            # 从0.7放宽到0.80
+        upward_ratio < 0.15 and            # 反向上升不超过15%
+        big_jump_ratio < 0.10              # 异常跳变不超过10%
+        # 注意：不再限制flat_ratio，允许KM曲线的长水平段
     )
 
+    # 综合评分（KM-aware）
     score_dict['final_score'] = (
         width_coverage * 100 +
-        avg_prob * 50 -
-        horizontal_ratio * 30
+        avg_prob * 50 +
+        flat_ratio * 10 -                  # 轻微奖励平坦（KM特征）
+        upward_ratio * 100 -               # 重度惩罚反向上升
+        big_jump_ratio * 80                # 重度惩罚异常跳变
     )
 
     return score_dict, is_valid
@@ -522,7 +570,9 @@ def trace_from_prob_map_ridge(prob_map: np.ndarray, num_curves: int = 3,
             'avg_prob': float(score_dict['avg_prob']),
             'y_range': float(score_dict['y_range']),
             'y_std': float(score_dict['y_std']),
-            'horizontal_ratio': float(score_dict['horizontal_ratio']),
+            'flat_ratio': float(score_dict['flat_ratio']),
+            'upward_ratio': float(score_dict['upward_ratio']),
+            'big_jump_ratio': float(score_dict['big_jump_ratio']),
             'is_valid': is_valid,
             'score': float(score_dict.get('final_score', 0))
         })
@@ -531,7 +581,9 @@ def trace_from_prob_map_ridge(prob_map: np.ndarray, num_curves: int = 3,
                    f"概率={score_dict['avg_prob']:.3f}, 质量={'PASS' if is_valid else 'FAIL'}")
         print(f"[fallback_trace] Round {round_idx+1}: 长度={len(path)}, 覆盖={score_dict['width_coverage']:.1%}, "
               f"概率={score_dict['avg_prob']:.3f}, y_range={score_dict['y_range']:.0f}, "
-              f"horiz={score_dict['horizontal_ratio']:.1%}, 质量={'PASS' if is_valid else 'FAIL'}")
+              f"flat={score_dict['flat_ratio']:.1%}, upward={score_dict['upward_ratio']:.1%}, "
+              f"big_jump={score_dict['big_jump_ratio']:.1%}, score={score_dict['final_score']:.1f}, "
+              f"质量={'PASS' if is_valid else 'FAIL'}")
 
         if not is_valid:
             round_log['status'] = 'failed_quality_check'

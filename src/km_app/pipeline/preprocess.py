@@ -89,7 +89,15 @@ def auto_detect_roi(image: np.ndarray, margin: int = 10) -> Tuple[int, int, int,
     content_cols = np.where(col_density > ch * 0.1)[0]
     if len(content_cols) > 0:
         right_content = content_cols[-1]
-        cw = min(cw, right_content + 30)
+        new_cw = min(cw, right_content + 30)
+
+        # 保护：防止右侧收紧过度，不允许宽度缩小超过50%
+        original_cw = best_rect[2]  # 初始候选框宽度
+        if new_cw < original_cw * 0.5:
+            print(f"[ROI] 右侧收紧过度 (new_cw={new_cw} < {original_cw * 0.5:.0f})，拒绝收紧，保持原宽度")
+        else:
+            cw = new_cw
+            print(f"[ROI] 右侧收紧: {original_cw} -> {cw}")
 
     # 4. 添加小边距并转换为(x1,y1,x2,y2)
     x1 = max(0, x - margin)

@@ -131,10 +131,27 @@ class KMPipeline:
         print(f"\n[Binary后处理] 开始处理...")
         logger.info(f"\n[postprocess] === 二分类后处理开始 ===")
 
-        # 2. 获取概率图并裁剪到ROI
+        # 2. 获取概率图 - 判断坐标系
         prob_map_full = pred_result['prob_map']
+        transform_info = pred_result.get('transform_info', {})
         x1, y1, x2, y2 = roi
-        prob_map = prob_map_full[y1:y2, x1:x2]  # 裁剪到ROI
+
+        # 关键修复：判断prob_map是整图坐标还是ROI局部坐标
+        # 如果推理时传入了roi，则prob_map已经是ROI局部坐标
+        if transform_info.get('roi') is not None:
+            # ROI模式：prob_map已经是ROI局部坐标，直接使用
+            prob_map = prob_map_full
+            print(f"[Binary后处理] 检测到ROI模式，prob_map已是局部坐标，尺寸: {prob_map.shape}")
+            logger.info(f"[postprocess] ROI模式，prob_map shape: {prob_map.shape}")
+        else:
+            # 整图模式：prob_map是全图坐标，需要裁剪
+            prob_map = prob_map_full[y1:y2, x1:x2]
+            print(f"[Binary后处理] 检测到整图模式，裁剪prob_map到ROI，尺寸: {prob_map.shape}")
+            logger.info(f"[postprocess] 整图模式，裁剪后prob_map shape: {prob_map.shape}")
+
+        # 防御性检查：确保prob_map非空
+        if prob_map.size == 0:
+            raise ValueError(f"prob_map为空数组！prob_map_full.shape={prob_map_full.shape}, roi={roi}, transform_info={transform_info}")
 
         print(f"[Binary后处理] 概率图统计: max={prob_map.max():.3f}, min={prob_map.min():.3f}, mean={prob_map.mean():.3f}")
         logger.info(f"[postprocess] 概率图统计: max={prob_map.max():.3f}, min={prob_map.min():.3f}, mean={prob_map.mean():.3f}")
@@ -174,16 +191,38 @@ class KMPipeline:
         print(f"[Binary后处理] Direct追踪: {len(direct_paths)} 条路径")
         logger.info(f"[postprocess] Direct追踪: {len(direct_paths)} 条路径")
 
-        # 检查Direct路径覆盖率
+        # 检查Direct路径覆盖率 - 改进：保底策略
         h, w = prob_map.shape
         valid_direct_paths = []
+        direct_path_scores = []  # 记录(path, coverage, score)
+
         for path in direct_paths:
             coverage = len(path) / w
-            if coverage >= 0.25:  # 从0.30降到0.25
+            # 计算路径平均概率
+            path_int = path.astype(int)
+            path_int[:, 0] = np.clip(path_int[:, 0], 0, w - 1)
+            path_int[:, 1] = np.clip(path_int[:, 1], 0, h - 1)
+            path_probs = prob_map[path_int[:, 1], path_int[:, 0]]
+            avg_prob = np.mean(path_probs)
+
+            # 综合评分
+            score = coverage * 100 + avg_prob * 50
+
+            direct_path_scores.append((path, coverage, score))
+
+            if coverage >= 0.20:  # 从0.25降到0.20
                 valid_direct_paths.append(path)
-                print(f"[Binary后处理] Direct路径: 长度={len(path)}, 覆盖={coverage:.1%} ✓")
+                print(f"[Binary后处理] Direct路径: 长度={len(path)}, 覆盖={coverage:.1%}, prob={avg_prob:.3f}, score={score:.1f} ✓")
             else:
-                print(f"[Binary后处理] Direct路径: 长度={len(path)}, 覆盖={coverage:.1%} ✗")
+                print(f"[Binary后处理] Direct路径: 长度={len(path)}, 覆盖={coverage:.1%}, prob={avg_prob:.3f}, score={score:.1f} ✗")
+
+        # 保底策略：如果Ridge=0且所有Direct都被过滤，保留top-2候选
+        if len(ridge_paths) == 0 and len(valid_direct_paths) == 0 and len(direct_path_scores) > 0:
+            print(f"[Binary后处理] Direct保底策略：Ridge=0且所有Direct被过滤，保留top-2候选")
+            direct_path_scores.sort(key=lambda x: x[2], reverse=True)  # 按score排序
+            for path, coverage, score in direct_path_scores[:2]:
+                valid_direct_paths.append(path)
+                print(f"[Binary后处理] Direct保底: 长度={len(path)}, 覆盖={coverage:.1%}, score={score:.1f} (保底)")
 
         direct_paths = valid_direct_paths
         print(f"[Binary后处理] Direct覆盖率过滤后: {len(direct_paths)} 条路径")
@@ -203,11 +242,26 @@ class KMPipeline:
         component_masks = filter_components_by_shape(binary_mask, min_area=300, min_width=50, prob_map=prob_map)
         print(f"[Binary后处理] 形状过滤: 保留 {len(component_masks)} 个组件")
 
+        # 改进：如果形状过滤后无组件，根据fg_ratio决定方向
         if len(component_masks) == 0:
-            print(f"[Binary后处理] 形状过滤后无组件，尝试更低阈值...")
-            fallback_mask = (prob_map > 0.15).astype(np.uint8) * 255
-            component_masks = filter_components_by_shape(fallback_mask, min_area=200, min_width=40, prob_map=prob_map)
-            print(f"[Binary后处理] 降低阈值后: 保留 {len(component_masks)} 个组件")
+            fg_ratio = seg_result['fg_ratio']
+            if fg_ratio > 0.50:
+                # fg_ratio过高，尝试更高阈值收紧
+                print(f"[Binary后处理] fg_ratio={fg_ratio:.3f}过高，尝试更高阈值收紧...")
+                for higher_thresh in [0.30, 0.35, 0.40, 0.45]:
+                    if higher_thresh <= seg_result['best_threshold']:
+                        continue
+                    fallback_mask = (prob_map > higher_thresh).astype(np.uint8) * 255
+                    component_masks = filter_components_by_shape(fallback_mask, min_area=200, min_width=40, prob_map=prob_map)
+                    print(f"[Binary后处理] 尝试阈值{higher_thresh}: 保留 {len(component_masks)} 个组件")
+                    if len(component_masks) > 0:
+                        break
+            else:
+                # fg_ratio不高，尝试更低阈值
+                print(f"[Binary后处理] fg_ratio={fg_ratio:.3f}不高，尝试更低阈值...")
+                fallback_mask = (prob_map > 0.10).astype(np.uint8) * 255
+                component_masks = filter_components_by_shape(fallback_mask, min_area=200, min_width=40, prob_map=prob_map)
+                print(f"[Binary后处理] 降低阈值后: 保留 {len(component_masks)} 个组件")
 
         # 提取skeleton
         skeletons = []
@@ -228,13 +282,38 @@ class KMPipeline:
         print(f"[Binary后处理] Regular辅助链: {len(regular_paths)} 条路径")
         logger.info(f"[postprocess] Regular辅助链: {len(regular_paths)} 条路径")
 
-        # 检查路径覆盖率
+        # 检查路径覆盖率 - 改进：保底策略
         h, w = prob_map.shape
         valid_regular_paths = []
+        regular_path_scores = []  # 记录(path, coverage, score)
+
         for path in regular_paths:
             coverage = len(path) / w
-            if coverage >= 0.35:
+            # 计算路径平均概率
+            path_int = path.astype(int)
+            path_int[:, 0] = np.clip(path_int[:, 0], 0, w - 1)
+            path_int[:, 1] = np.clip(path_int[:, 1], 0, h - 1)
+            path_probs = prob_map[path_int[:, 1], path_int[:, 0]]
+            avg_prob = np.mean(path_probs)
+
+            # 综合评分
+            score = coverage * 100 + avg_prob * 50
+
+            regular_path_scores.append((path, coverage, score))
+
+            if coverage >= 0.30:  # 从0.35降到0.30
                 valid_regular_paths.append(path)
+                print(f"[Binary后处理] Regular路径: 长度={len(path)}, 覆盖={coverage:.1%}, prob={avg_prob:.3f}, score={score:.1f} ✓")
+            else:
+                print(f"[Binary后处理] Regular路径: 长度={len(path)}, 覆盖={coverage:.1%}, prob={avg_prob:.3f}, score={score:.1f} ✗")
+
+        # 保底策略：如果Ridge=0且Direct=0且所有Regular都被过滤，保留top-2候选
+        if len(ridge_paths) == 0 and len(direct_paths) == 0 and len(valid_regular_paths) == 0 and len(regular_path_scores) > 0:
+            print(f"[Binary后处理] Regular保底策略：Ridge=0且Direct=0且所有Regular被过滤，保留top-2候选")
+            regular_path_scores.sort(key=lambda x: x[2], reverse=True)  # 按score排序
+            for path, coverage, score in regular_path_scores[:2]:
+                valid_regular_paths.append(path)
+                print(f"[Binary后处理] Regular保底: 长度={len(path)}, 覆盖={coverage:.1%}, score={score:.1f} (保底)")
 
         regular_paths = valid_regular_paths
         print(f"[Binary后处理] Regular覆盖率过滤后: {len(regular_paths)} 条路径")
