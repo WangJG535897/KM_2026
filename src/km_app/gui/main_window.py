@@ -17,7 +17,7 @@ from ..utils import draw_curves_on_image, create_mask_visualization
 
 
 class ProcessThread(QThread):
-    """处理线程"""
+    """处理线程 - Color-first默认"""
     finished = Signal(dict)
     error = Signal(str)
     progress = Signal(str)
@@ -33,56 +33,29 @@ class ProcessThread(QThread):
 
     def run(self):
         try:
-            import torch
-            from ..pipeline.preprocess import auto_detect_roi
+            from ..pipeline.color_extract import extract_colored_curves
             from ..utils import draw_curves_on_image
 
             # 加载图像
             self.progress.emit("加载图像...")
             image = load_image(self.image_path)
             h, w = image.shape[:2]
-            print(f"\n{'='*60}")
-            print(f"[主流程] 原始图像尺寸: {w}x{h}")
 
             # 确定ROI
             if self.roi_mode == 'manual' and self.manual_roi is not None:
                 roi = self.manual_roi
-                print(f"[主流程] ROI模式: 手动")
-                print(f"[主流程] 手动ROI: {roi}")
             elif self.roi_mode == 'auto':
-                print(f"[主流程] ROI模式: 自动")
                 self.progress.emit("自动检测ROI...")
+                from ..pipeline.preprocess import auto_detect_roi
                 roi = auto_detect_roi(image)
             else:  # full
-                h, w = image.shape[:2]
                 roi = (0, 0, w, h)
-                print(f"[主流程] ROI模式: 全图")
-                print(f"[主流程] 全图ROI: {roi}")
 
-            x1, y1, x2, y2 = roi
-            roi_w, roi_h = x2 - x1, y2 - y1
-            print(f"[主流程] 最终ROI尺寸: {roi_w}x{roi_h}")
-            self.progress.emit(f"ROI: ({x1},{y1},{x2},{y2})")
+            self.progress.emit(f"ROI: {roi}")
 
-            # 选择设备
-            device = 'cuda' if torch.cuda.is_available() else 'cpu'
-            print(f"[主流程] 推理设备: {device.upper()}")
-            self.progress.emit(f"推理设备: {device.upper()}")
-
-            # 加载模型
-            self.progress.emit("加载模型...")
-            inference = ModelInference(self.checkpoint_path, device=device)
-            inference.load_model()
-
-            # 推理（ROI优先）
-            self.progress.emit("模型推理中...")
-            print(f"[主流程] 开始推理...")
-            pred_result = inference.predict(image, roi=roi)
-
-            # 处理
-            self.progress.emit("处理曲线...")
-            pipeline = KMPipeline(x_max=self.x_max)
-            result = pipeline.process(image, pred_result, roi=roi)
+            # Color-first提取
+            self.progress.emit("提取彩色曲线...")
+            result = extract_colored_curves(image, roi=roi, n_colors=5)
 
             # 保存结果
             self.progress.emit("保存结果...")
@@ -90,66 +63,53 @@ class ProcessThread(QThread):
             output_path.mkdir(parents=True, exist_ok=True)
 
             # 保存ROI裁剪
-            if 'roi_image' in result:
-                save_image(result['roi_image'], str(output_path / "roi_crop.png"))
+            save_image(result['roi_image'], str(output_path / "roi_crop.png"))
 
-            # 保存概率图
-            if 'prob_map' in result:
-                prob_vis = (result['prob_map'] * 255).astype(np.uint8)
-                prob_color = cv2.applyColorMap(prob_vis, cv2.COLORMAP_JET)
-                save_image(prob_color, str(output_path / "prob_map.png"))
+            # 保存color masks
+            for i, mask in enumerate(result['color_masks']):
+                save_image(mask, str(output_path / "mask_color_{}.png".format(i+1)))
 
-            # 保存多阈值二值图（关键阈值）
-            if 'prob_map' in result:
-                key_thresholds = [0.12, 0.15, 0.18, 0.20, 0.25, 0.30, 0.35, 0.40]
-                for thresh in key_thresholds:
-                    binary_t = (result['prob_map'] > thresh).astype(np.uint8) * 255
-                    save_image(binary_t, str(output_path / f"binary_t{int(thresh*100):03d}.png"))
-
-            # 保存最佳阈值二值图
-            if 'binary_mask' in result:
-                save_image(result['binary_mask'], str(output_path / "binary_best.png"))
-
-            # 保存组件过滤结果
-            if 'component_masks' in result and len(result['component_masks']) > 0:
-                cc_combined = np.zeros_like(result['component_masks'][0])
-                for mask in result['component_masks']:
-                    cc_combined = np.maximum(cc_combined, mask)
-                save_image(cc_combined, str(output_path / "cc_filtered.png"))
-
-            # 保存skeleton
-            if 'skeleton' in result:
-                save_image(result['skeleton'], str(output_path / "skeleton.png"))
+            # 保存separated masks
+            for i, mask in enumerate(result['separated_masks']):
+                save_image(mask, str(output_path / "mask_component_{}.png".format(i+1)))
 
             # 保存ROI局部结果
-            if 'pixel_paths_roi' in result and len(result['pixel_paths_roi']) > 0:
+            if len(result['pixel_paths_roi']) > 0:
                 result_roi = draw_curves_on_image(result['roi_image'], result['pixel_paths_roi'])
                 save_image(result_roi, str(output_path / "result_roi.png"))
 
             # 保存全图结果
-            if 'pixel_paths_global' in result and len(result['pixel_paths_global']) > 0:
+            if len(result['pixel_paths_global']) > 0:
                 result_global = draw_curves_on_image(result['original_image'], result['pixel_paths_global'])
                 save_image(result_global, str(output_path / "result_global.png"))
 
-                # 导出CSV
-                if 'chart_coords' in result:
-                    export_all_curves(result['chart_coords'], str(output_path), "curve")
+                # 保存像素坐标CSV
+                for i, path in enumerate(result['pixel_paths_global']):
+                    csv_path = output_path / "curve_pixels_{}.csv".format(i+1)
+                    np.savetxt(csv_path, path, delimiter=',', header='x,y', comments='', fmt='%d')
+
+            # 保存debug overlay
+            if len(result['pixel_paths_roi']) > 0:
+                debug_overlay = result['roi_image'].copy()
+                colors = [(0,255,0), (255,0,0), (0,0,255), (255,255,0), (255,0,255)]
+                for i, path in enumerate(result['pixel_paths_roi']):
+                    color = colors[i % len(colors)]
+                    for j in range(len(path)-1):
+                        cv2.line(debug_overlay, tuple(path[j]), tuple(path[j+1]), color, 2)
+                save_image(debug_overlay, str(output_path / "debug_overlay.png"))
 
             # 保存处理信息
             info_lines = [
                 f"处理时间: {np.datetime64('now')}",
-                f"ROI: {result.get('roi', 'N/A')}",
-                f"最佳阈值: {result.get('best_threshold', 'N/A')}",
-                f"前景占比: {result.get('fg_ratio', 'N/A'):.4f}",
-                f"估计曲线数: {result.get('estimated_curve_count', 'N/A')}",
-                f"最终曲线数: {result.get('num_curves', 0)}",
-                f"使用方法: {result.get('selected_method', 'N/A')}",
-                f"Fallback触发: {result.get('fallback_triggered', False)}"
+                f"ROI: {result['roi']}",
+                f"颜色数: {result['stats']['n_colors']}",
+                f"连通域数: {result['stats']['n_components']}",
+                f"最终曲线数: {result['num_curves']}",
+                f"前景像素: {result['stats'].get('foreground_pixels', 'N/A')}"
             ]
-            with open(output_path / "process_info.txt", 'w', encoding='utf-8') as f:
+            with open(output_path / "process.log", 'w', encoding='utf-8') as f:
                 f.write('\n'.join(info_lines))
 
-            print(f"{'='*60}\n")
             self.progress.emit("完成!")
             self.finished.emit(result)
 
@@ -241,9 +201,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "错误", "请选择有效的图像文件")
             return
 
-        if not checkpoint_path or not Path(checkpoint_path).exists():
-            QMessageBox.warning(self, "错误", "请选择有效的模型文件")
-            return
+        # 模型文件不再强制要求（color-first不需要）
+        # if not checkpoint_path or not Path(checkpoint_path).exists():
+        #     QMessageBox.warning(self, "错误", "请选择有效的模型文件")
+        #     return
 
         # 检查手动ROI
         if roi_mode == 'manual' and self.manual_roi is None:
