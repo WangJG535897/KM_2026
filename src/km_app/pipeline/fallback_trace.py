@@ -110,22 +110,31 @@ def _find_all_start_seeds(prob_map: np.ndarray, used_mask: np.ndarray,
     在左侧left_width宽度范围内，找所有候选起点(col, y, prob, forward_score)
     返回按综合评分倒序的列表
 
-    改进：
-    1. 过滤顶部和底部边界区域
-    2. 增加"前向支撑"评分，避免孤立峰值和短碎片起点
-    3. 返回(col, y, prob, forward_score)四元组
+    KM曲线先验：
+    1. 起点只允许出现在左侧前5%~15%
+    2. 起点y只允许位于上部10%~35%
+    3. 起始20~40列必须形成近水平高位平台
+    4. 起点如果位于下半区，直接拒绝
     """
     H, W = prob_map.shape
     raw_candidates = []
 
-    # 边界屏蔽：顶部10%和底部5%
-    margin_top = int(H * 0.10)
-    margin_bottom = int(H * 0.95)
+    # KM先验：边界屏蔽
+    margin_top = int(H * 0.10)  # 顶部10%
+    margin_bottom = int(H * 0.35)  # 只允许上部35%
+    left_start = int(W * 0.05)  # 左侧5%
+    left_end = int(W * 0.15)  # 左侧15%
 
     raw_peak_count = 0
+    reject_stats = {
+        'out_of_y_range': 0,
+        'out_of_x_range': 0,
+        'no_horizontal_platform': 0,
+        'weak_forward_support': 0
+    }
 
-    # 对左侧每一列
-    for col in range(min(left_width, W)):
+    # 对左侧指定范围内的每一列
+    for col in range(left_start, min(left_end, W)):
         col_prob = prob_map[:, col] * (1 - used_mask[:, col].astype(float))
         col_smooth = gaussian_filter1d(col_prob, sigma=1.5)
 
@@ -141,44 +150,62 @@ def _find_all_start_seeds(prob_map: np.ndarray, used_mask: np.ndarray,
 
         # 对每个峰，记录(col, y, prob)
         for peak_idx in peaks:
-            # 过滤顶部和底部边界
+            # KM先验1：y必须在上部10%~35%
             if peak_idx < margin_top or peak_idx >= margin_bottom:
+                reject_stats['out_of_y_range'] += 1
                 continue
 
             raw_candidates.append((col, peak_idx, col_prob[peak_idx]))
 
-    print(f"[起点过滤] 原始峰值: {raw_peak_count}, 边界过滤后: {len(raw_candidates)}")
+    print(f"[起点过滤] 原始峰值: {raw_peak_count}, y范围过滤后: {len(raw_candidates)}")
 
-    # 对每个候选计算前向支撑评分
+    # 对每个候选进行KM先验检查
     scored_candidates = []
     for col, y, prob in raw_candidates:
-        # 前向支撑评分：检查右侧10列的持续支撑
-        forward_score = 0.0
-        support_cols = 0
+        # KM先验2：检查起始20~40列是否形成近水平高位平台
+        platform_cols = min(40, W - col)
+        platform_y_list = []
+        platform_prob_list = []
 
-        for offset in range(1, min(11, W - col)):
+        for offset in range(1, platform_cols + 1):
             right_col = col + offset
             if right_col >= W:
                 break
 
             # 检查右侧列在该y附近是否有高概率
-            y_min = max(0, y - 15)
-            y_max = min(H, y + 15)
+            y_min = max(0, y - 10)
+            y_max = min(H, y + 10)
             right_region = prob_map[y_min:y_max, right_col]
 
             if len(right_region) > 0:
-                max_prob = right_region.max()
-                if max_prob > min_prob * 0.4:  # 右侧支撑阈值
-                    support_cols += 1
-                    forward_score += max_prob
+                max_idx = np.argmax(right_region)
+                max_prob = right_region[max_idx]
+                if max_prob > min_prob * 0.4:
+                    platform_y_list.append(y_min + max_idx)
+                    platform_prob_list.append(max_prob)
 
-        # 综合评分：起点概率 + 前向支撑
-        # 要求至少5列有支撑
-        if support_cols >= 5:
-            combined_score = prob * 0.5 + forward_score * 0.5
-            scored_candidates.append((col, y, prob, forward_score, combined_score))
+        # 检查平台质量
+        if len(platform_y_list) < 20:  # 至少20列支撑
+            reject_stats['weak_forward_support'] += 1
+            continue
 
-    print(f"[起点过滤] 前向支撑检查后: {len(scored_candidates)}")
+        # 检查y方向稳定性（近水平）
+        y_std = np.std(platform_y_list)
+        if y_std > 15:  # y方向波动不能太大
+            reject_stats['no_horizontal_platform'] += 1
+            continue
+
+        # 计算前向支撑评分
+        forward_score = np.sum(platform_prob_list)
+
+        # 综合评分：起点概率 + 前向支撑 + 平台稳定性
+        combined_score = prob * 0.3 + forward_score * 0.5 + (1.0 / (y_std + 1)) * 0.2
+        scored_candidates.append((col, y, prob, forward_score, combined_score, y_std))
+
+    print(f"[起点过滤] KM先验检查后: {len(scored_candidates)}")
+    print(f"[起点过滤] 拒绝统计: y范围={reject_stats['out_of_y_range']}, "
+          f"无水平平台={reject_stats['no_horizontal_platform']}, "
+          f"前向支撑弱={reject_stats['weak_forward_support']}")
 
     # 按综合评分倒序排列
     scored_candidates.sort(key=lambda x: x[4], reverse=True)
@@ -188,7 +215,9 @@ def _find_all_start_seeds(prob_map: np.ndarray, used_mask: np.ndarray,
 
     if len(result) > 0:
         best = result[0]
-        print(f"[起点过滤] 最佳起点: col={best[0]}, y={best[1]}, prob={best[2]:.3f}, forward_score={best[3]:.3f}")
+        best_full = scored_candidates[0]
+        print(f"[起点过滤] 最佳起点: col={best[0]}, y={best[1]}, prob={best[2]:.3f}, "
+              f"forward_score={best[3]:.3f}, y_std={best_full[5]:.1f}")
 
     return result
 

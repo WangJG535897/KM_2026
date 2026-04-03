@@ -15,6 +15,59 @@ from .km_constraints import apply_km_constraints_batch
 from .mapping import CoordinateMapper
 
 
+def detect_plot_bbox(prob_map: np.ndarray) -> Tuple[int, int, int, int]:
+    """
+    在ROI内检测真实plot box边界（左侧y轴与底部x轴围成的绘图区）
+
+    策略：
+    1. 左边界：从左向右扫描，找到第一个有明显垂直结构的列（y轴）
+    2. 底边界：从下向上扫描，找到第一个有明显水平结构的行（x轴）
+    3. 右边界：ROI右侧减去一定margin（图例区）
+    4. 顶边界：ROI顶部加上一定margin（标题区）
+
+    Returns:
+        (x1, y1, x2, y2) plot box坐标
+    """
+    H, W = prob_map.shape
+
+    # 1. 检测左边界（y轴）
+    left_margin = 0
+    for x in range(min(int(W * 0.15), 100)):  # 只检查左侧15%或100列
+        col = prob_map[:, x]
+        # 如果该列有较多高响应像素，可能是y轴
+        high_prob_count = np.sum(col > 0.3)
+        if high_prob_count > H * 0.3:  # 超过30%高度
+            left_margin = x + 5  # y轴右侧5像素
+            break
+
+    # 2. 检测底边界（x轴）
+    bottom_margin = H
+    for y in range(H - 1, max(int(H * 0.75), H - 100), -1):  # 只检查底部25%或100行
+        row = prob_map[y, :]
+        # 如果该行有较多高响应像素，可能是x轴
+        high_prob_count = np.sum(row > 0.3)
+        if high_prob_count > W * 0.3:  # 超过30%宽度
+            bottom_margin = y - 5  # x轴上方5像素
+            break
+
+    # 3. 右边界：保守估计，去掉右侧20%（图例区）
+    right_margin = int(W * 0.80)
+
+    # 4. 顶边界：保守估计，去掉顶部5%（标题区）
+    top_margin = int(H * 0.05)
+
+    # 防御性检查
+    if left_margin >= right_margin or top_margin >= bottom_margin:
+        # 检测失败，返回保守的默认值
+        print(f"[plot_bbox检测] 失败，使用默认值")
+        return (int(W * 0.05), int(H * 0.05), int(W * 0.80), int(H * 0.85))
+
+    print(f"[plot_bbox检测] 左边界={left_margin}, 右边界={right_margin}, 顶边界={top_margin}, 底边界={bottom_margin}")
+    print(f"[plot_bbox检测] plot_bbox=({left_margin},{top_margin},{right_margin},{bottom_margin}), 尺寸={(right_margin-left_margin)}x{(bottom_margin-top_margin)}")
+
+    return (left_margin, top_margin, right_margin, bottom_margin)
+
+
 def suppress_non_curve_regions(prob_map: np.ndarray) -> Tuple[np.ndarray, Dict]:
     """
     轻量级预清洗：抑制明显非主曲线区域
@@ -236,8 +289,14 @@ class KMPipeline:
         print(f"[Binary后处理] 概率图统计: max={prob_map.max():.3f}, min={prob_map.min():.3f}, mean={prob_map.mean():.3f}")
         logger.info(f"[postprocess] 概率图统计: max={prob_map.max():.3f}, min={prob_map.min():.3f}, mean={prob_map.mean():.3f}")
 
-        # === 预清洗：抑制非曲线区域 ===
-        prob_map_cleaned, clean_debug = suppress_non_curve_regions(prob_map)
+        # === 检测真实 plot_bbox ===
+        plot_bbox = detect_plot_bbox(prob_map)
+        plot_x1, plot_y1, plot_x2, plot_y2 = plot_bbox
+        plot_prob_map = prob_map[plot_y1:plot_y2, plot_x1:plot_x2]
+        print(f"[Binary后处理] plot_bbox内概率图统计: max={plot_prob_map.max():.3f}, mean={plot_prob_map.mean():.3f}")
+
+        # === 预清洗：抑制非曲线区域（在plot_bbox内） ===
+        prob_map_cleaned, clean_debug = suppress_non_curve_regions(plot_prob_map)
         print(f"[Binary后处理] 预清洗后统计: max={prob_map_cleaned.max():.3f}, mean={prob_map_cleaned.mean():.3f}")
 
         # 估计曲线数量（仅供参考）- 强制限制在1-3
@@ -260,8 +319,8 @@ class KMPipeline:
 
         # === 辅助链：直接从prob_map追踪 ===
         logger.info(f"\n[postprocess] === 辅助链：直接prob_map追踪 ===")
-        # 直接将prob_map二值化并追踪
-        direct_mask = (prob_map > 0.20).astype(np.uint8) * 255
+        # 直接将prob_map二值化并追踪（在plot_bbox内）
+        direct_mask = (prob_map_cleaned > 0.20).astype(np.uint8) * 255
 
         # 尝试分离多条曲线
         from .color_refine import separate_curves_by_connectivity
@@ -276,17 +335,17 @@ class KMPipeline:
         logger.info(f"[postprocess] Direct追踪: {len(direct_paths)} 条路径")
 
         # 检查Direct路径覆盖率 - 改进：保底策略
-        h, w = prob_map.shape
+        plot_h, plot_w = prob_map_cleaned.shape
         valid_direct_paths = []
         direct_path_scores = []  # 记录(path, coverage, score)
 
         for path in direct_paths:
-            coverage = len(path) / w
+            coverage = len(path) / plot_w
             # 计算路径平均概率
             path_int = path.astype(int)
-            path_int[:, 0] = np.clip(path_int[:, 0], 0, w - 1)
-            path_int[:, 1] = np.clip(path_int[:, 1], 0, h - 1)
-            path_probs = prob_map[path_int[:, 1], path_int[:, 0]]
+            path_int[:, 0] = np.clip(path_int[:, 0], 0, plot_w - 1)
+            path_int[:, 1] = np.clip(path_int[:, 1], 0, plot_h - 1)
+            path_probs = prob_map_cleaned[path_int[:, 1], path_int[:, 0]]
             avg_prob = np.mean(path_probs)
 
             # 综合评分
@@ -316,8 +375,8 @@ class KMPipeline:
 
         # === 辅助链：Binary分割追踪（作为主要方法） ===
         logger.info(f"\n[postprocess] === 辅助链：Binary分割追踪 ===")
-        # 使用ROI-cropped prob_map创建临时pred_result
-        temp_pred_result = {'prob_map': prob_map, 'mode': 'binary'}
+        # 使用plot_bbox内的prob_map创建临时pred_result
+        temp_pred_result = {'prob_map': prob_map_cleaned, 'mode': 'binary'}
         seg_result = process_binary_segmentation(temp_pred_result, roi_image)
         binary_mask = seg_result['binary_mask']
 
@@ -325,7 +384,7 @@ class KMPipeline:
         logger.info(f"[postprocess] Binary阈值: {seg_result['best_threshold']}, fg_ratio: {seg_result['fg_ratio']:.4f}")
 
         # 形状过滤
-        component_masks = filter_components_by_shape(binary_mask, min_area=300, min_width=50, prob_map=prob_map)
+        component_masks = filter_components_by_shape(binary_mask, min_area=300, min_width=50, prob_map=prob_map_cleaned)
         print(f"[Binary后处理] 形状过滤: 保留 {len(component_masks)} 个组件")
 
         # 改进：如果形状过滤后无组件，根据fg_ratio决定方向
@@ -337,16 +396,16 @@ class KMPipeline:
                 for higher_thresh in [0.30, 0.35, 0.40, 0.45]:
                     if higher_thresh <= seg_result['best_threshold']:
                         continue
-                    fallback_mask = (prob_map > higher_thresh).astype(np.uint8) * 255
-                    component_masks = filter_components_by_shape(fallback_mask, min_area=200, min_width=40, prob_map=prob_map)
+                    fallback_mask = (prob_map_cleaned > higher_thresh).astype(np.uint8) * 255
+                    component_masks = filter_components_by_shape(fallback_mask, min_area=200, min_width=40, prob_map=prob_map_cleaned)
                     print(f"[Binary后处理] 尝试阈值{higher_thresh}: 保留 {len(component_masks)} 个组件")
                     if len(component_masks) > 0:
                         break
             else:
                 # fg_ratio不高，尝试更低阈值
                 print(f"[Binary后处理] fg_ratio={fg_ratio:.3f}不高，尝试更低阈值...")
-                fallback_mask = (prob_map > 0.10).astype(np.uint8) * 255
-                component_masks = filter_components_by_shape(fallback_mask, min_area=200, min_width=40, prob_map=prob_map)
+                fallback_mask = (prob_map_cleaned > 0.10).astype(np.uint8) * 255
+                component_masks = filter_components_by_shape(fallback_mask, min_area=200, min_width=40, prob_map=prob_map_cleaned)
                 print(f"[Binary后处理] 降低阈值后: 保留 {len(component_masks)} 个组件")
 
         # 提取skeleton
@@ -369,17 +428,17 @@ class KMPipeline:
         logger.info(f"[postprocess] Regular辅助链: {len(regular_paths)} 条路径")
 
         # 检查路径覆盖率 - 改进：保底策略
-        h, w = prob_map.shape
+        plot_h, plot_w = prob_map_cleaned.shape
         valid_regular_paths = []
         regular_path_scores = []  # 记录(path, coverage, score)
 
         for path in regular_paths:
-            coverage = len(path) / w
+            coverage = len(path) / plot_w
             # 计算路径平均概率
             path_int = path.astype(int)
-            path_int[:, 0] = np.clip(path_int[:, 0], 0, w - 1)
-            path_int[:, 1] = np.clip(path_int[:, 1], 0, h - 1)
-            path_probs = prob_map[path_int[:, 1], path_int[:, 0]]
+            path_int[:, 0] = np.clip(path_int[:, 0], 0, plot_w - 1)
+            path_int[:, 1] = np.clip(path_int[:, 1], 0, plot_h - 1)
+            path_probs = prob_map_cleaned[path_int[:, 1], path_int[:, 1]]
             avg_prob = np.mean(path_probs)
 
             # 综合评分
@@ -445,13 +504,13 @@ class KMPipeline:
         # 只有通过完整性验证的路径才能成为最终输出
         validated_paths = []
         for idx, path in enumerate(final_paths):
-            coverage = len(path) / w
-            # 最低完整性要求：覆盖率至少30%
-            if coverage >= 0.30:
+            coverage = len(path) / plot_w
+            # 最低完整性要求：覆盖率至少20%（从30%降低）
+            if coverage >= 0.20:
                 validated_paths.append(path)
                 print(f"[Binary后处理] 路径{idx+1}通过完整性验证: 覆盖={coverage:.1%} ✓")
             else:
-                print(f"[Binary后处理] 路径{idx+1}未通过完整性验证: 覆盖={coverage:.1%} < 30% ✗ (拒绝输出)")
+                print(f"[Binary后处理] 路径{idx+1}未通过完整性验证: 覆盖={coverage:.1%} < 20% ✗ (拒绝输出)")
                 output_confidence = 'low'
 
         final_paths = validated_paths
@@ -472,8 +531,16 @@ class KMPipeline:
         print(f"[Binary后处理] KM约束后: {len(constrained_paths_roi)} 条路径")
         logger.info(f"[postprocess] KM约束后: {len(constrained_paths_roi)} 条路径")
 
+        # 将plot_bbox内的路径坐标转换回原始ROI坐标
+        constrained_paths_roi_adjusted = []
+        for path in constrained_paths_roi:
+            path_adjusted = path.copy()
+            path_adjusted[:, 0] += plot_x1  # x坐标偏移
+            path_adjusted[:, 1] += plot_y1  # y坐标偏移
+            constrained_paths_roi_adjusted.append(path_adjusted)
+
         # 转换为全图坐标
-        constrained_paths_global = convert_roi_paths_to_global(constrained_paths_roi, roi)
+        constrained_paths_global = convert_roi_paths_to_global(constrained_paths_roi_adjusted, roi)
 
         # 坐标映射（基于ROI局部坐标）
         x1, y1, x2, y2 = roi
@@ -483,7 +550,7 @@ class KMPipeline:
             y_range=self.y_range
         )
 
-        chart_coords = self.mapper.batch_paths_to_chart(constrained_paths_roi)
+        chart_coords = self.mapper.batch_paths_to_chart(constrained_paths_roi_adjusted)
 
         # 合并skeleton用于可视化
         combined_skeleton = np.zeros_like(binary_mask)
@@ -536,9 +603,9 @@ class KMPipeline:
             'component_masks': component_masks,
             'skeleton': combined_skeleton,
             'separated_masks': separated_masks,
-            'pixel_paths_roi': constrained_paths_roi,
+            'pixel_paths_roi': constrained_paths_roi_adjusted,
             'pixel_paths_global': constrained_paths_global,
-            'pixel_paths': constrained_paths_roi,  # 兼容旧代码
+            'pixel_paths': constrained_paths_roi_adjusted,  # 兼容旧代码
             'chart_coords': chart_coords,
             'num_curves': len(chart_coords),
             'fg_ratio': seg_result['fg_ratio'],
@@ -546,6 +613,7 @@ class KMPipeline:
             'fallback_triggered': fallback_triggered,
             'selected_method': selected_method,
             'output_confidence': output_confidence,  # 新增
+            'plot_bbox': plot_bbox,  # 新增
             'ridge_debug': ridge_debug,  # 新增：Ridge调试信息
             'ridge_paths_count': len(ridge_paths),  # 新增
             'regular_paths_count': len(regular_paths)  # 新增
