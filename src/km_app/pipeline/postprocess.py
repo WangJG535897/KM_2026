@@ -15,6 +15,86 @@ from .km_constraints import apply_km_constraints_batch
 from .mapping import CoordinateMapper
 
 
+def suppress_non_curve_regions(prob_map: np.ndarray) -> Tuple[np.ndarray, Dict]:
+    """
+    轻量级预清洗：抑制明显非主曲线区域
+
+    处理目标：
+    1. 右上图例区域
+    2. 下方统计文本区域
+    3. 细长竖线型删失标记
+
+    Returns:
+        (cleaned_prob_map, debug_info)
+    """
+    H, W = prob_map.shape
+    cleaned = prob_map.copy()
+    suppression_mask = np.zeros_like(prob_map, dtype=bool)
+
+    debug_info = {
+        'legend_region': None,
+        'bottom_text_region': None,
+        'vertical_lines_count': 0
+    }
+
+    print(f"\n[预清洗] 开始抑制非曲线区域...")
+
+    # 1. 右上图例区域抑制（启发式：右上角20%x20%区域）
+    legend_h = int(H * 0.20)
+    legend_w_start = int(W * 0.75)
+    legend_region = cleaned[:legend_h, legend_w_start:]
+    if legend_region.mean() > 0.15:  # 如果该区域有明显响应
+        cleaned[:legend_h, legend_w_start:] *= 0.3  # 降权70%
+        suppression_mask[:legend_h, legend_w_start:] = True
+        debug_info['legend_region'] = (0, legend_w_start, legend_h, W)
+        print(f"[预清洗] 抑制右上图例区: y=[0,{legend_h}], x=[{legend_w_start},{W}], mean_prob={legend_region.mean():.3f}")
+
+    # 2. 下方统计文本区域抑制（启发式：底部15%区域）
+    bottom_h_start = int(H * 0.85)
+    bottom_region = cleaned[bottom_h_start:, :]
+    if bottom_region.mean() > 0.15:  # 如果该区域有明显响应
+        cleaned[bottom_h_start:, :] *= 0.3  # 降权70%
+        suppression_mask[bottom_h_start:, :] = True
+        debug_info['bottom_text_region'] = (bottom_h_start, 0, H, W)
+        print(f"[预清洗] 抑制下方文本区: y=[{bottom_h_start},{H}], mean_prob={bottom_region.mean():.3f}")
+
+    # 3. 细长竖线型删失标记抑制
+    # 检测每列的垂直连续性
+    vertical_lines_suppressed = 0
+    for x in range(W):
+        col = prob_map[:, x]
+        high_prob_pixels = np.sum(col > 0.3)
+
+        # 如果某列有很多高概率像素，但宽度很窄，可能是竖线
+        if high_prob_pixels > H * 0.15:  # 超过15%高度
+            # 检查左右邻域是否也有类似响应（真曲线会有宽度）
+            left_support = 0
+            right_support = 0
+
+            if x > 0:
+                left_col = prob_map[:, x-1]
+                left_support = np.sum(left_col > 0.3)
+
+            if x < W - 1:
+                right_col = prob_map[:, x+1]
+                right_support = np.sum(right_col > 0.3)
+
+            # 如果左右支撑都很弱，判定为孤立竖线
+            if left_support < H * 0.05 and right_support < H * 0.05:
+                cleaned[:, x] *= 0.2  # 降权80%
+                suppression_mask[:, x] = True
+                vertical_lines_suppressed += 1
+
+    if vertical_lines_suppressed > 0:
+        debug_info['vertical_lines_count'] = vertical_lines_suppressed
+        print(f"[预清洗] 抑制竖线删失标记: {vertical_lines_suppressed} 列")
+
+    suppression_ratio = np.sum(suppression_mask) / (H * W)
+    print(f"[预清洗] ✓ 完成，抑制像素占比: {suppression_ratio:.1%}\n")
+
+    return cleaned, debug_info
+
+
 def convert_roi_paths_to_global(paths_roi: List[np.ndarray], roi: Tuple[int, int, int, int]) -> List[np.ndarray]:
     """将ROI局部坐标路径转换为全图坐标
 
@@ -156,8 +236,12 @@ class KMPipeline:
         print(f"[Binary后处理] 概率图统计: max={prob_map.max():.3f}, min={prob_map.min():.3f}, mean={prob_map.mean():.3f}")
         logger.info(f"[postprocess] 概率图统计: max={prob_map.max():.3f}, min={prob_map.min():.3f}, mean={prob_map.mean():.3f}")
 
+        # === 预清洗：抑制非曲线区域 ===
+        prob_map_cleaned, clean_debug = suppress_non_curve_regions(prob_map)
+        print(f"[Binary后处理] 预清洗后统计: max={prob_map_cleaned.max():.3f}, mean={prob_map_cleaned.mean():.3f}")
+
         # 估计曲线数量（仅供参考）- 强制限制在1-3
-        estimated_count_raw = estimate_curve_count_from_prob_map(prob_map, min_prob=0.2, min_distance=15)
+        estimated_count_raw = estimate_curve_count_from_prob_map(prob_map_cleaned, min_prob=0.2, min_distance=15)
         estimated_count = max(1, min(estimated_count_raw, 3))  # 强制限制
         print(f"[Binary后处理] 估计曲线数: {estimated_count_raw} -> 限制为 {estimated_count}")
         logger.info(f"[postprocess] 估计曲线数: {estimated_count_raw} -> 限制为 {estimated_count}")
@@ -167,7 +251,7 @@ class KMPipeline:
         from .fallback_trace import trace_from_prob_map_ridge
 
         ridge_paths, ridge_debug = trace_from_prob_map_ridge(
-            prob_map,
+            prob_map_cleaned,  # 使用清洗后的prob_map
             num_curves=estimated_count,  # 使用限制后的数量
             min_prob=0.15  # 从0.2降到0.15
         )
@@ -216,16 +300,18 @@ class KMPipeline:
             else:
                 print(f"[Binary后处理] Direct路径: 长度={len(path)}, 覆盖={coverage:.1%}, prob={avg_prob:.3f}, score={score:.1f} ✗")
 
-        # 保底策略：如果Ridge=0且所有Direct都被过滤，保留top-2候选
+        # 保底策略：如果Ridge=0且所有Direct都被过滤，保留top-2候选作为DEBUG候选
+        # 注意：这些候选不会直接成为最终输出，需要通过后续完整性验证
+        debug_direct_candidates = []
         if len(ridge_paths) == 0 and len(valid_direct_paths) == 0 and len(direct_path_scores) > 0:
-            print(f"[Binary后处理] Direct保底策略：Ridge=0且所有Direct被过滤，保留top-2候选")
+            print(f"[Binary后处理] Direct保底策略：Ridge=0且所有Direct被过滤，保留top-2作为DEBUG候选（非最终输出）")
             direct_path_scores.sort(key=lambda x: x[2], reverse=True)  # 按score排序
             for path, coverage, score in direct_path_scores[:2]:
-                valid_direct_paths.append(path)
-                print(f"[Binary后处理] Direct保底: 长度={len(path)}, 覆盖={coverage:.1%}, score={score:.1f} (保底)")
+                debug_direct_candidates.append(path)
+                print(f"[Binary后处理] Direct DEBUG候选: 长度={len(path)}, 覆盖={coverage:.1%}, score={score:.1f} (仅供调试)")
 
         direct_paths = valid_direct_paths
-        print(f"[Binary后处理] Direct覆盖率过滤后: {len(direct_paths)} 条路径")
+        print(f"[Binary后处理] Direct覆盖率过滤后: {len(direct_paths)} 条路径 (DEBUG候选: {len(debug_direct_candidates)} 条)")
         logger.info(f"[postprocess] Direct覆盖率过滤后: {len(direct_paths)} 条路径")
 
         # === 辅助链：Binary分割追踪（作为主要方法） ===
@@ -307,16 +393,18 @@ class KMPipeline:
             else:
                 print(f"[Binary后处理] Regular路径: 长度={len(path)}, 覆盖={coverage:.1%}, prob={avg_prob:.3f}, score={score:.1f} ✗")
 
-        # 保底策略：如果Ridge=0且Direct=0且所有Regular都被过滤，保留top-2候选
+        # 保底策略：如果Ridge=0且Direct=0且所有Regular都被过滤，保留top-2作为DEBUG候选
+        # 注意：这些候选不会直接成为最终输出，需要通过后续完整性验证
+        debug_regular_candidates = []
         if len(ridge_paths) == 0 and len(direct_paths) == 0 and len(valid_regular_paths) == 0 and len(regular_path_scores) > 0:
-            print(f"[Binary后处理] Regular保底策略：Ridge=0且Direct=0且所有Regular被过滤，保留top-2候选")
+            print(f"[Binary后处理] Regular保底策略：Ridge=0且Direct=0且所有Regular被过滤，保留top-2作为DEBUG候选（非最终输出）")
             regular_path_scores.sort(key=lambda x: x[2], reverse=True)  # 按score排序
             for path, coverage, score in regular_path_scores[:2]:
-                valid_regular_paths.append(path)
-                print(f"[Binary后处理] Regular保底: 长度={len(path)}, 覆盖={coverage:.1%}, score={score:.1f} (保底)")
+                debug_regular_candidates.append(path)
+                print(f"[Binary后处理] Regular DEBUG候选: 长度={len(path)}, 覆盖={coverage:.1%}, score={score:.1f} (仅供调试)")
 
         regular_paths = valid_regular_paths
-        print(f"[Binary后处理] Regular覆盖率过滤后: {len(regular_paths)} 条路径")
+        print(f"[Binary后处理] Regular覆盖率过滤后: {len(regular_paths)} 条路径 (DEBUG候选: {len(debug_regular_candidates)} 条)")
         logger.info(f"[postprocess] Regular覆盖率过滤后: {len(regular_paths)} 条路径")
 
         # === 融合决策 ===
@@ -324,18 +412,21 @@ class KMPipeline:
         selected_method = 'ridge_primary'
         final_paths = ridge_paths
         fallback_triggered = False
+        output_confidence = 'high'  # 新增：输出置信度
 
         # 优先级：Ridge > Direct > Regular
         if len(ridge_paths) == 0 and len(direct_paths) > 0:
             selected_method = 'direct_fallback'
             final_paths = direct_paths
             fallback_triggered = True
+            output_confidence = 'medium'
             logger.info(f"[postprocess] Ridge失败，使用Direct fallback")
             print(f"[Binary后处理] Ridge失败，使用Direct fallback")
         elif len(ridge_paths) == 0 and len(regular_paths) > 0:
             selected_method = 'regular_fallback'
             final_paths = regular_paths
             fallback_triggered = True
+            output_confidence = 'medium'
             logger.info(f"[postprocess] Ridge和Direct失败，使用Regular fallback")
             print(f"[Binary后处理] Ridge和Direct失败，使用Regular fallback")
         elif len(ridge_paths) > 0:
@@ -344,18 +435,37 @@ class KMPipeline:
         else:
             logger.info(f"[postprocess] 所有方法都失败")
             print(f"[Binary后处理] 所有方法都失败")
+            output_confidence = 'failed'
 
         logger.info(f"[postprocess] 最终方法: {selected_method}")
         logger.info(f"[postprocess] 最终曲线数: {len(final_paths)}")
-        print(f"[Binary后处理] 最终方法: {selected_method}, 曲线数: {len(final_paths)}")
+        print(f"[Binary后处理] 最终方法: {selected_method}, 曲线数: {len(final_paths)}, 置信度: {output_confidence}")
+
+        # === 最终输出完整性验证 ===
+        # 只有通过完整性验证的路径才能成为最终输出
+        validated_paths = []
+        for idx, path in enumerate(final_paths):
+            coverage = len(path) / w
+            # 最低完整性要求：覆盖率至少30%
+            if coverage >= 0.30:
+                validated_paths.append(path)
+                print(f"[Binary后处理] 路径{idx+1}通过完整性验证: 覆盖={coverage:.1%} ✓")
+            else:
+                print(f"[Binary后处理] 路径{idx+1}未通过完整性验证: 覆盖={coverage:.1%} < 30% ✗ (拒绝输出)")
+                output_confidence = 'low'
+
+        final_paths = validated_paths
+        print(f"[Binary后处理] 完整性验证后: {len(final_paths)} 条路径")
 
         # 失败诊断
         if len(final_paths) == 0:
-            logger.warning(f"[postprocess] ALERT: 未检测到曲线!")
+            logger.warning(f"[postprocess] ALERT: 未检测到完整曲线!")
             logger.warning(f"  Ridge失败原因: {len(ridge_paths)} 条路径")
+            logger.warning(f"  Direct失败原因: {len(direct_paths)} 条路径")
             logger.warning(f"  Regular失败原因: {len(regular_paths)} 条路径")
             logger.warning(f"  建议检查: prob_map统计、水平线抑制、起点检测")
-            print(f"[Binary后处理] ⚠️ ALERT: 未检测到曲线!")
+            print(f"[Binary后处理] ⚠️ ALERT: 未检测到完整曲线! 输出置信度: {output_confidence}")
+            print(f"[Binary后处理] 可用DEBUG候选: Direct={len(debug_direct_candidates) if 'debug_direct_candidates' in locals() else 0}, Regular={len(debug_regular_candidates) if 'debug_regular_candidates' in locals() else 0}")
 
         # 应用KM约束
         constrained_paths_roi = apply_km_constraints_batch(final_paths)
@@ -380,8 +490,8 @@ class KMPipeline:
         for sk in skeletons:
             combined_skeleton = np.maximum(combined_skeleton, sk)
 
-        print(f"[Binary后处理] ✓ 最终提取: {len(chart_coords)} 条曲线 (方法: {selected_method})\n")
-        logger.info(f"[postprocess] ✓ 完成，最终提取: {len(chart_coords)} 条曲线\n")
+        print(f"[Binary后处理] ✓ 最终提取: {len(chart_coords)} 条曲线 (方法: {selected_method}, 置信度: {output_confidence})\n")
+        logger.info(f"[postprocess] ✓ 完成，最终提取: {len(chart_coords)} 条曲线，置信度: {output_confidence}\n")
 
         # 保存调试图像
         from pathlib import Path
@@ -435,6 +545,7 @@ class KMPipeline:
             'estimated_curve_count': len(final_paths),  # 使用实际提取数
             'fallback_triggered': fallback_triggered,
             'selected_method': selected_method,
+            'output_confidence': output_confidence,  # 新增
             'ridge_debug': ridge_debug,  # 新增：Ridge调试信息
             'ridge_paths_count': len(ridge_paths),  # 新增
             'regular_paths_count': len(regular_paths)  # 新增

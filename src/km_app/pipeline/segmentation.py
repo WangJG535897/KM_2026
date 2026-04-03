@@ -206,7 +206,7 @@ def process_multiclass_segmentation(pred_result: dict, image: np.ndarray) -> dic
 
 def filter_components_by_shape(mask: np.ndarray, min_area=100, min_width=50,
                                prob_map: np.ndarray = None) -> List[np.ndarray]:
-    """根据形状特征过滤连通域 - 放宽版
+    """根据形状特征过滤连通域 - 放宽版 + giant blob拒绝
 
     Args:
         mask: 二值mask
@@ -236,6 +236,21 @@ def filter_components_by_shape(mask: np.ndarray, min_area=100, min_width=50,
         aspect_ratio = cw / (ch + 1e-6)
 
         if cw < min_width:
+            continue
+
+        # === Giant blob检测：拒绝几乎覆盖整个ROI的超大组件 ===
+        bbox_coverage_w = cw / w
+        bbox_coverage_h = ch / h
+        area_ratio = area / (h * w)
+
+        # 如果bbox几乎覆盖整个ROI，判定为giant blob
+        if bbox_coverage_w > 0.90 and bbox_coverage_h > 0.80:
+            print(f"  组件{i+1}: GIANT BLOB拒绝 (bbox={cw}x{ch}, w_cov={bbox_coverage_w:.2f}, h_cov={bbox_coverage_h:.2f}, area_ratio={area_ratio:.2f})")
+            continue
+
+        # 如果area占比过大，也判定为giant blob
+        if area_ratio > 0.50:
+            print(f"  组件{i+1}: GIANT BLOB拒绝 (area_ratio={area_ratio:.2f} > 0.50)")
             continue
 
         # KM曲线特征：横向延展长、细 - 放宽要求
@@ -269,7 +284,8 @@ def filter_components_by_shape(mask: np.ndarray, min_area=100, min_width=50,
             aspect_ratio >= 1.5 and  # 从2.0降到1.5
             cw >= min_width and
             skeleton_len > 30 and  # 从50降到30
-            h_coverage > 0.05  # 从0.1降到0.05
+            h_coverage > 0.05 and  # 从0.1降到0.05
+            h_coverage < 0.95  # 新增：横向覆盖不能接近100%
         )
 
         # 如果有概率图，额外要求平均概率>0.12（从0.15降到0.12）

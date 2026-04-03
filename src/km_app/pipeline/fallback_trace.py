@@ -105,21 +105,24 @@ def suppress_horizontal_reference_lines(
 
 def _find_all_start_seeds(prob_map: np.ndarray, used_mask: np.ndarray,
                           left_width: int, min_prob: float,
-                          min_distance: int) -> List[Tuple[int, int, float]]:
+                          min_distance: int) -> List[Tuple[int, int, float, float]]:
     """
-    在左侧left_width宽度范围内，找所有候选起点(col, y, prob)
-    返回按概率倒序的列表：[(col1, y1, prob1), (col2, y2, prob2), ...]
+    在左侧left_width宽度范围内，找所有候选起点(col, y, prob, forward_score)
+    返回按综合评分倒序的列表
 
     改进：
     1. 过滤顶部和底部边界区域
-    2. 增加"向右支撑"检查，避免孤立峰值
+    2. 增加"前向支撑"评分，避免孤立峰值和短碎片起点
+    3. 返回(col, y, prob, forward_score)四元组
     """
     H, W = prob_map.shape
-    candidates = []
+    raw_candidates = []
 
     # 边界屏蔽：顶部10%和底部5%
     margin_top = int(H * 0.10)
     margin_bottom = int(H * 0.95)
+
+    raw_peak_count = 0
 
     # 对左侧每一列
     for col in range(min(left_width, W)):
@@ -134,37 +137,60 @@ def _find_all_start_seeds(prob_map: np.ndarray, used_mask: np.ndarray,
             distance=min_distance
         )
 
+        raw_peak_count += len(peaks)
+
         # 对每个峰，记录(col, y, prob)
         for peak_idx in peaks:
             # 过滤顶部和底部边界
             if peak_idx < margin_top or peak_idx >= margin_bottom:
                 continue
 
-            # 向右支撑检查：检查右侧5列是否有持续支撑
-            right_support_count = 0
-            for offset in range(1, min(6, W - col)):
-                right_col = col + offset
-                if right_col >= W:
-                    break
-                # 检查右侧列在该y附近是否有高概率
-                y_min = max(0, peak_idx - 10)
-                y_max = min(H, peak_idx + 10)
-                right_region = prob_map[y_min:y_max, right_col]
-                if right_region.max() > min_prob * 0.5:  # 右侧支撑阈值降低50%
-                    right_support_count += 1
+            raw_candidates.append((col, peak_idx, col_prob[peak_idx]))
 
-            # 要求至少3列有支撑
-            if right_support_count >= 3:
-                candidates.append((col, peak_idx, col_prob[peak_idx]))
+    print(f"[起点过滤] 原始峰值: {raw_peak_count}, 边界过滤后: {len(raw_candidates)}")
 
-    # 按概率倒序排列
-    candidates.sort(key=lambda x: x[2], reverse=True)
+    # 对每个候选计算前向支撑评分
+    scored_candidates = []
+    for col, y, prob in raw_candidates:
+        # 前向支撑评分：检查右侧10列的持续支撑
+        forward_score = 0.0
+        support_cols = 0
 
-    print(f"[起点过滤] 原始峰值: {len(peaks) if 'peaks' in locals() else 'N/A'}, "
-          f"边界过滤后: {len([c for c in candidates if margin_top <= c[1] < margin_bottom])}, "
-          f"支撑检查后: {len(candidates)}")
+        for offset in range(1, min(11, W - col)):
+            right_col = col + offset
+            if right_col >= W:
+                break
 
-    return candidates
+            # 检查右侧列在该y附近是否有高概率
+            y_min = max(0, y - 15)
+            y_max = min(H, y + 15)
+            right_region = prob_map[y_min:y_max, right_col]
+
+            if len(right_region) > 0:
+                max_prob = right_region.max()
+                if max_prob > min_prob * 0.4:  # 右侧支撑阈值
+                    support_cols += 1
+                    forward_score += max_prob
+
+        # 综合评分：起点概率 + 前向支撑
+        # 要求至少5列有支撑
+        if support_cols >= 5:
+            combined_score = prob * 0.5 + forward_score * 0.5
+            scored_candidates.append((col, y, prob, forward_score, combined_score))
+
+    print(f"[起点过滤] 前向支撑检查后: {len(scored_candidates)}")
+
+    # 按综合评分倒序排列
+    scored_candidates.sort(key=lambda x: x[4], reverse=True)
+
+    # 返回(col, y, prob, forward_score)
+    result = [(c[0], c[1], c[2], c[3]) for c in scored_candidates]
+
+    if len(result) > 0:
+        best = result[0]
+        print(f"[起点过滤] 最佳起点: col={best[0]}, y={best[1]}, prob={best[2]:.3f}, forward_score={best[3]:.3f}")
+
+    return result
 
 
 def _extract_column_candidates(prob_map: np.ndarray, used_mask: np.ndarray,
@@ -505,19 +531,20 @@ def trace_from_prob_map_ridge(prob_map: np.ndarray, num_curves: int = 3,
             print(f"[fallback_trace] Round {round_idx+1}: 无足够候选 (candidates={len(candidates) if candidates else 0}, best_prob={candidates[0][2] if candidates else 0:.3f}, min_prob={min_prob})")
             break
 
-        # 3.2 选择最强候选
-        best_col, best_y, best_prob = candidates[0]
+        # 3.2 选择最强候选（按综合评分）
+        best_col, best_y, best_prob, best_forward_score = candidates[0]
 
         round_log = {
             'round': round_idx + 1,
             'start_col': int(best_col),
             'start_y': int(best_y),
             'start_prob': float(best_prob),
+            'start_forward_score': float(best_forward_score),
             'candidates_count': len(candidates)
         }
 
-        logger.info(f"[fallback_trace] 起点: col={best_col}, y={best_y}, prob={best_prob:.3f}")
-        print(f"[fallback_trace] Round {round_idx+1}: 起点 col={best_col}, y={best_y}, prob={best_prob:.3f}, 候选数={len(candidates)}")
+        logger.info(f"[fallback_trace] 起点: col={best_col}, y={best_y}, prob={best_prob:.3f}, forward_score={best_forward_score:.3f}")
+        print(f"[fallback_trace] Round {round_idx+1}: 起点 col={best_col}, y={best_y}, prob={best_prob:.3f}, forward_score={best_forward_score:.3f}, 候选数={len(candidates)}")
 
         # 3.3 DP追踪（优化版：候选点DP + 超时保护）
         path = _dp_trace_single_path(
@@ -589,6 +616,15 @@ def trace_from_prob_map_ridge(prob_map: np.ndarray, num_curves: int = 3,
             round_log['status'] = 'failed_quality_check'
             debug_log['rounds'].append(round_log)
             print(f"[fallback_trace] Round {round_idx+1}: 质量检查失败")
+
+            # 抑制失败的起点，避免重复尝试
+            y_min = max(0, best_y - 20)
+            y_max = min(H, best_y + 20)
+            x_min = max(0, best_col - 10)
+            x_max = min(W, best_col + 10)
+            used_mask[y_min:y_max, x_min:x_max] = True
+            print(f"[fallback_trace] Round {round_idx+1}: 抑制失败起点 ({best_col}, {best_y})")
+
             continue
 
         # 3.5 间距检查
