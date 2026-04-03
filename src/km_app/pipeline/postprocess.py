@@ -131,8 +131,10 @@ class KMPipeline:
         print(f"\n[Binary后处理] 开始处理...")
         logger.info(f"\n[postprocess] === 二分类后处理开始 ===")
 
-        # 2. 获取概率图
-        prob_map = pred_result['prob_map']
+        # 2. 获取概率图并裁剪到ROI
+        prob_map_full = pred_result['prob_map']
+        x1, y1, x2, y2 = roi
+        prob_map = prob_map_full[y1:y2, x1:x2]  # 裁剪到ROI
 
         print(f"[Binary后处理] 概率图统计: max={prob_map.max():.3f}, min={prob_map.min():.3f}, mean={prob_map.mean():.3f}")
         logger.info(f"[postprocess] 概率图统计: max={prob_map.max():.3f}, min={prob_map.min():.3f}, mean={prob_map.mean():.3f}")
@@ -155,9 +157,43 @@ class KMPipeline:
         print(f"[Binary后处理] Ridge主链提取: {len(ridge_paths)} 条路径")
         logger.info(f"[postprocess] Ridge主链提取: {len(ridge_paths)} 条路径")
 
-        # === 辅助链：Binary分割追踪（降级为参考） ===
+        # === 辅助链：直接从prob_map追踪 ===
+        logger.info(f"\n[postprocess] === 辅助链：直接prob_map追踪 ===")
+        # 直接将prob_map二值化并追踪
+        direct_mask = (prob_map > 0.20).astype(np.uint8) * 255
+
+        # 尝试分离多条曲线
+        from .color_refine import separate_curves_by_connectivity
+        from .segmentation import extract_skeleton_from_mask
+        skeleton = extract_skeleton_from_mask(direct_mask)
+        separated_direct_masks = separate_curves_by_connectivity(skeleton, min_size=100)
+        print(f"[Binary后处理] Direct分离: {len(separated_direct_masks)} 个组件")
+
+        from .trace import trace_multiple_curves
+        direct_paths = trace_multiple_curves(separated_direct_masks, enable_smooth=False)
+        print(f"[Binary后处理] Direct追踪: {len(direct_paths)} 条路径")
+        logger.info(f"[postprocess] Direct追踪: {len(direct_paths)} 条路径")
+
+        # 检查Direct路径覆盖率
+        h, w = prob_map.shape
+        valid_direct_paths = []
+        for path in direct_paths:
+            coverage = len(path) / w
+            if coverage >= 0.25:  # 从0.30降到0.25
+                valid_direct_paths.append(path)
+                print(f"[Binary后处理] Direct路径: 长度={len(path)}, 覆盖={coverage:.1%} ✓")
+            else:
+                print(f"[Binary后处理] Direct路径: 长度={len(path)}, 覆盖={coverage:.1%} ✗")
+
+        direct_paths = valid_direct_paths
+        print(f"[Binary后处理] Direct覆盖率过滤后: {len(direct_paths)} 条路径")
+        logger.info(f"[postprocess] Direct覆盖率过滤后: {len(direct_paths)} 条路径")
+
+        # === 辅助链：Binary分割追踪（作为主要方法） ===
         logger.info(f"\n[postprocess] === 辅助链：Binary分割追踪 ===")
-        seg_result = process_binary_segmentation(pred_result, roi_image)
+        # 使用ROI-cropped prob_map创建临时pred_result
+        temp_pred_result = {'prob_map': prob_map, 'mode': 'binary'}
+        seg_result = process_binary_segmentation(temp_pred_result, roi_image)
         binary_mask = seg_result['binary_mask']
 
         print(f"[Binary后处理] 最佳阈值: {seg_result['best_threshold']}, 前景占比: {seg_result['fg_ratio']:.4f}")
@@ -210,29 +246,25 @@ class KMPipeline:
         final_paths = ridge_paths
         fallback_triggered = False
 
-        # 仅当ridge提取结果质量太差时，考虑fallback到regular
-        if len(ridge_paths) == 0 and len(regular_paths) > 0:
+        # 优先级：Ridge > Direct > Regular
+        if len(ridge_paths) == 0 and len(direct_paths) > 0:
+            selected_method = 'direct_fallback'
+            final_paths = direct_paths
+            fallback_triggered = True
+            logger.info(f"[postprocess] Ridge失败，使用Direct fallback")
+            print(f"[Binary后处理] Ridge失败，使用Direct fallback")
+        elif len(ridge_paths) == 0 and len(regular_paths) > 0:
             selected_method = 'regular_fallback'
             final_paths = regular_paths
             fallback_triggered = True
-            logger.info(f"[postprocess] Ridge失败，使用Regular fallback")
-            print(f"[Binary后处理] Ridge失败，使用Regular fallback")
-        elif len(ridge_paths) == 1 and len(regular_paths) >= 2:
-            # Hybrid：如果ridge只提1条但regular提2条，考虑合并
-            # 检查regular路径质量
-            from .fallback_trace import _score_path
-            all_valid = all(_score_path(p, prob_map, w)[1] for p in regular_paths)
-            if all_valid:
-                selected_method = 'hybrid'
-                final_paths = ridge_paths + regular_paths
-                logger.info(f"[postprocess] Hybrid模式：Ridge {len(ridge_paths)} + Regular {len(regular_paths)}")
-                print(f"[Binary后处理] Hybrid模式：Ridge {len(ridge_paths)} + Regular {len(regular_paths)}")
-            else:
-                logger.info(f"[postprocess] 使用Ridge primary（Regular质量不足）")
-                print(f"[Binary后处理] 使用Ridge primary（Regular质量不足）")
-        else:
+            logger.info(f"[postprocess] Ridge和Direct失败，使用Regular fallback")
+            print(f"[Binary后处理] Ridge和Direct失败，使用Regular fallback")
+        elif len(ridge_paths) > 0:
             logger.info(f"[postprocess] 使用Ridge primary")
             print(f"[Binary后处理] 使用Ridge primary")
+        else:
+            logger.info(f"[postprocess] 所有方法都失败")
+            print(f"[Binary后处理] 所有方法都失败")
 
         logger.info(f"[postprocess] 最终方法: {selected_method}")
         logger.info(f"[postprocess] 最终曲线数: {len(final_paths)}")

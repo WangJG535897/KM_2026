@@ -139,7 +139,7 @@ def _find_all_start_seeds(prob_map: np.ndarray, used_mask: np.ndarray,
 
 
 def _extract_column_candidates(prob_map: np.ndarray, used_mask: np.ndarray,
-                               col: int, top_k: int = 5, min_prob: float = 0.05) -> List[Tuple[int, float]]:
+                               col: int, top_k: int = 5, min_prob: float = 0.03) -> List[Tuple[int, float]]:
     """
     从某列提取 top-K 候选点（y坐标，概率）
 
@@ -156,9 +156,9 @@ def _extract_column_candidates(prob_map: np.ndarray, used_mask: np.ndarray,
     H = prob_map.shape[0]
     col_prob = prob_map[:, col] * (1 - used_mask[:, col].astype(float))
 
-    # 找局部峰值
+    # 找局部峰值 - 移除prominence要求
     col_smooth = gaussian_filter1d(col_prob, sigma=1.5)
-    peaks, _ = find_peaks(col_smooth, height=min_prob, prominence=0.02, distance=10)  # 降低prominence
+    peaks, _ = find_peaks(col_smooth, height=min_prob, distance=10)  # 移除prominence
 
     if len(peaks) == 0:
         # 如果没有峰值，取最大值点
@@ -221,7 +221,7 @@ def _dp_trace_single_path(prob_map: np.ndarray, used_mask: np.ndarray,
             break
 
         # 获取下一列的候选点
-        next_candidates = _extract_column_candidates(prob_map, used_mask, col + 1, top_k=5, min_prob=0.05)
+        next_candidates = _extract_column_candidates(prob_map, used_mask, col + 1, top_k=5, min_prob=0.03)
         if not next_candidates:
             # 如果下一列没有候选，从当前状态延续
             for (c, y), (cost, _) in current_states:
@@ -305,9 +305,9 @@ def _dp_trace_single_path(prob_map: np.ndarray, used_mask: np.ndarray,
     logger.debug(f"[DP] 回溯路径长度: {len(path)}, 需要>{max_cols * 0.3:.0f}")
     print(f"  [DP] 回溯路径长度: {len(path)}, 需要>{max_cols * 0.3:.0f}")
 
-    # 检查路径长度
-    if len(path) < max_cols * 0.3:  # 至少覆盖30%
-        logger.debug(f"[DP] 路径太短: {len(path)} < {max_cols * 0.3:.0f}")
+    # 检查路径长度 - 非常宽松，只要有一定长度就接受
+    if len(path) < 20:  # 只要超过20个点就接受
+        logger.debug(f"[DP] 路径太短: {len(path)} < 20")
         print(f"  [DP] 路径太短")
         return None
 
@@ -358,7 +358,7 @@ def _score_path(path: np.ndarray, prob_map: np.ndarray, roi_width: int) -> Tuple
         width_coverage >= 0.35 and          # 覆盖至少35%宽度
         avg_prob >= 0.15 and               # 平均概率足够
         y_range >= 5 and                   # Y方向不能完全水平
-        horizontal_ratio < 0.7             # 不能有超过70%的点是水平的
+        horizontal_ratio < 0.80            # 从0.7放宽到0.80
     )
 
     score_dict['final_score'] = (
@@ -480,17 +480,17 @@ def trace_from_prob_map_ridge(prob_map: np.ndarray, num_curves: int = 3,
             penalties={
                 'low_prob': 1.0,
                 'jump': 0.05,
-                'horizontal': 0.5,
+                'horizontal': 0.5,  # 恢复原值0.5
                 'gap': 0.5
             },
-            max_y_jump=15,  # 从30降到15
+            max_y_jump=50,  # 从25提高到50，非常宽松
             width_expand=W,
             timeout_seconds=2.0  # 单条路径最多2秒
         )
 
-        if path is None or len(path) < W * 0.30:  # 降低到30%
+        if path is None or len(path) < 20:  # 只要超过20个点
             logger.info(f"[fallback_trace] 路径追踪失败或太短")
-            print(f"[fallback_trace] Round {round_idx+1}: 路径失败 (path={'None' if path is None else len(path)}, 需要>{W*0.30:.0f})")
+            print(f"[fallback_trace] Round {round_idx+1}: 路径失败 (path={'None' if path is None else len(path)}, 需要>20)")
 
             # 打印DP调试信息（从logger获取）
             import logging
