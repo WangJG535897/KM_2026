@@ -1,41 +1,57 @@
 # Python cache
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
 
-# Outputs
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build / temp / logs
+build/
+dist/
+*.egg-info/
+logs/
+tmp/
+temp/
 outputs/
-*.png
-*.csv
-*.txt
-
-# Training artifacts
-models/debug/
-models/checkpoint_epoch_*.pth
-models/best_model.pth
-models/best_model_new.pth
-
-# Training data debug
-training_data/debug_vis/
-training_data/masks_vis/
-
-# Temporary files
 *.log
 *.tmp
 *.zip
 
-# IDE
+# Images - do NOT upload
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.gif
+*.tif
+*.tiff
+*.webp
+*.svg
+
+# Model weights - do NOT upload
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.bin
+*.safetensors
+*.pkl
+*.joblib
+
+# Training/debug visualization
+training_data/debug_vis/
+training_data/masks_vis/
+
+# IDE / Editor
 .vscode/
 .idea/
 *.swp
 *.swo
 
-# OS
+# OS files
 .DS_Store
 Thumbs.db
 desktop.ini
-
-models/*.pth
-
-models/*.pth
