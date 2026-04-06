@@ -21,8 +21,30 @@ def extract_skeleton(mask: np.ndarray) -> np.ndarray:
 
 
 def trace_curve_column_scan(mask: np.ndarray, start_x: Optional[int] = None, max_jump: int = 15) -> np.ndarray:
-    """列扫描追踪曲线路径 - 增强版"""
+    """列扫描追踪曲线路径 - 增强版（先骨架化再追踪）"""
     h, w = mask.shape
+
+    # 先骨架化（如果mask是厚的）
+    if np.sum(mask > 0) > 100:
+        # 检查是否需要骨架化
+        # 计算平均宽度
+        col_widths = []
+        for x in range(0, w, max(1, w // 20)):  # 采样20列
+            col = mask[:, x]
+            if np.sum(col > 0) > 0:
+                # 找连续段
+                diff = np.diff(np.concatenate(([0], col > 0, [0])).astype(int))
+                starts = np.where(diff == 1)[0]
+                ends = np.where(diff == -1)[0]
+                if len(starts) > 0 and len(ends) > 0:
+                    widths = ends - starts
+                    col_widths.extend(widths.tolist())
+
+        if len(col_widths) > 0:
+            avg_width = np.mean(col_widths)
+            if avg_width > 3:  # 如果平均宽度>3，需要骨架化
+                skeleton = skeletonize(mask > 0).astype(np.uint8) * 255
+                mask = skeleton
 
     if start_x is None:
         start_x = 0
@@ -52,7 +74,7 @@ def trace_curve_column_scan(mask: np.ndarray, start_x: Optional[int] = None, max
 
     # 逐列扫描
     gap_count = 0
-    max_gap = 5  # 允许最多5列gap
+    max_gap = 8  # 允许最多8列gap（从5增加到8）
 
     for x in range(start_x + 1, w):
         col = mask[:, x]
@@ -63,7 +85,7 @@ def trace_curve_column_scan(mask: np.ndarray, start_x: Optional[int] = None, max
             gap_count += 1
             if gap_count > max_gap:
                 break  # gap太大，停止
-            # 保持当前y继续
+            # 保持当前y继续（bridge短gap）
             path_points.append([x, current_y])
             continue
 
@@ -217,7 +239,7 @@ def trace_multiple_curves(masks: List[np.ndarray], enable_smooth: bool = False) 
     """
     all_paths = []
 
-    for mask in masks:
+    for idx, mask in enumerate(masks):
         # 先提取skeleton
         skeleton = extract_skeleton(mask)
 
@@ -233,6 +255,16 @@ def trace_multiple_curves(masks: List[np.ndarray], enable_smooth: bool = False) 
             path = trace_curve_ridge(mask)
 
         if len(path) > 0:
+            # 基本完整性检查
+            h, w = mask.shape
+            x_span = path[:, 0].max() - path[:, 0].min()
+            coverage = x_span / w if w > 0 else 0
+
+            # 如果覆盖率太低，标记为不完整
+            if coverage < 0.10:  # 至少覆盖10%宽度
+                print(f"  [trace] mask{idx+1}: 路径覆盖不足 {coverage:.1%}, 跳过")
+                continue
+
             # 仅在启用时才平滑（保守模式）
             if enable_smooth:
                 path = smooth_path(path, window_size=3, aggressive=False)
