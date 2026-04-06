@@ -438,7 +438,7 @@ class KMPipeline:
             path_int = path.astype(int)
             path_int[:, 0] = np.clip(path_int[:, 0], 0, plot_w - 1)
             path_int[:, 1] = np.clip(path_int[:, 1], 0, plot_h - 1)
-            path_probs = prob_map_cleaned[path_int[:, 1], path_int[:, 1]]
+            path_probs = prob_map_cleaned[path_int[:, 1], path_int[:, 0]]
             avg_prob = np.mean(path_probs)
 
             # 综合评分

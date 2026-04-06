@@ -1,100 +1,129 @@
-"""CLI命令行入口"""
+"""CLI命令行入口 - Color-first默认"""
 import sys
 import argparse
 from pathlib import Path
+import numpy as np
 
 # 添加src到路径
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-from km_app.model import ModelInference
-from km_app.pipeline import KMPipeline
-from km_app.io import load_image, save_image, export_all_curves, setup_logger
-from km_app.utils import draw_curves_on_image, create_mask_visualization
-from km_app.config import DEFAULT_MODEL_PATH, DEFAULT_OUTPUT_DIR, DEFAULT_X_MAX
+from km_app.io import load_image, save_image, setup_logger
+from km_app.config import DEFAULT_OUTPUT_DIR
 
 
 def main():
-    """CLI主函数"""
-    parser = argparse.ArgumentParser(description="KM生存曲线提取工具 - 命令行版本")
+    """CLI主函数 - Color-first默认"""
+    parser = argparse.ArgumentParser(description="曲线提取工具 - 从图片提取带颜色的线")
 
     parser.add_argument("--image", "-i", required=True, help="输入图像路径")
-    parser.add_argument("--checkpoint", "-c", default=str(DEFAULT_MODEL_PATH),
-                       help="模型权重路径")
     parser.add_argument("--outdir", "-o", default=str(DEFAULT_OUTPUT_DIR),
                        help="输出目录")
-    parser.add_argument("--x-max", type=float, default=DEFAULT_X_MAX,
-                       help="X轴最大时间")
+    parser.add_argument("--n-colors", type=int, default=5,
+                       help="颜色聚类数（默认5）")
     parser.add_argument("--debug", action="store_true", help="启用调试模式")
 
     args = parser.parse_args()
 
     # 设置日志
-    log_file = Path(args.outdir) / "process.log" if args.debug else None
-    logger = setup_logger("KM_CLI", log_file)
+    output_path = Path(args.outdir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    log_file = output_path / "process.log"
+    logger = setup_logger("CLI", log_file)
 
     try:
         # 1. 加载图像
         logger.info(f"加载图像: {args.image}")
+        print(f"\n加载图像: {args.image}")
         image = load_image(args.image)
-        logger.info(f"图像尺寸: {image.shape}")
+        h, w = image.shape[:2]
+        logger.info(f"图像尺寸: {w}x{h}")
+        print(f"图像尺寸: {w}x{h}")
 
-        # 2. 加载模型
-        logger.info(f"加载模型: {args.checkpoint}")
-        inference = ModelInference(args.checkpoint)
-        inference.load_model()
+        # 2. Color-first提取
+        logger.info("开始提取彩色曲线...")
+        print("开始提取彩色曲线...")
 
-        # 3. 推理
-        logger.info("开始推理...")
-        pred_result = inference.predict(image)
-        logger.info(f"推理完成，输出类别数: {pred_result['num_classes']}")
+        from km_app.pipeline.color_extract import extract_colored_curves
+        result = extract_colored_curves(image, roi=None, n_colors=args.n_colors)
 
-        # 4. 处理
-        logger.info("处理曲线...")
-        pipeline = KMPipeline(x_max=args.x_max)
-        result = pipeline.process(image, pred_result)
-        logger.info(f"提取到 {result['num_curves']} 条曲线")
+        logger.info(f"提取完成: {result['num_curves']} 条曲线")
+        print(f"\n提取完成: {result['num_curves']} 条曲线")
 
-        # 5. 保存结果
-        output_path = Path(args.outdir)
-        output_path.mkdir(parents=True, exist_ok=True)
-
+        # 3. 保存结果
         logger.info(f"保存结果到: {output_path}")
+        print(f"保存结果到: {output_path}")
 
-        # 保存原图
-        save_image(image, str(output_path / "original.png"))
+        # 保存ROI裁剪
+        save_image(result['roi_image'], str(output_path / "roi_crop.png"))
 
-        # 保存ROI
-        save_image(result['roi_image'], str(output_path / "roi.png"))
+        # 保存color masks
+        for i, mask in enumerate(result['color_masks']):
+            save_image(mask, str(output_path / f"mask_color_{i+1}.png"))
 
-        # 保存结果图
-        result_image = draw_curves_on_image(result['roi_image'], result['pixel_paths'])
-        save_image(result_image, str(output_path / "result.png"))
+        # 保存separated masks
+        for i, mask in enumerate(result['separated_masks']):
+            save_image(mask, str(output_path / f"mask_component_{i+1}.png"))
 
-        # 保存masks
-        if args.debug:
-            for i, mask in enumerate(result['refined_masks']):
-                save_image(mask, str(output_path / f"mask_{i+1}.png"))
+        # 保存ROI局部结果
+        if len(result['pixel_paths_roi']) > 0:
+            from km_app.utils import draw_curves_on_image
+            result_roi = draw_curves_on_image(result['roi_image'], result['pixel_paths_roi'])
+            save_image(result_roi, str(output_path / "result_roi.png"))
 
-            # 保存mask可视化
-            mask_vis = create_mask_visualization(result['refined_masks'],
-                                                result['roi_image'].shape)
-            save_image(mask_vis, str(output_path / "masks_visualization.png"))
+        # 保存全图结果
+        if len(result['pixel_paths_global']) > 0:
+            from km_app.utils import draw_curves_on_image
+            result_global = draw_curves_on_image(result['original_image'], result['pixel_paths_global'])
+            save_image(result_global, str(output_path / "result_global.png"))
 
-        # 导出CSV
-        export_all_curves(result['chart_coords'], str(output_path), "curve")
+            # 保存像素坐标CSV
+            for i, path in enumerate(result['pixel_paths_global']):
+                csv_path = output_path / f"curve_pixels_{i+1}.csv"
+                np.savetxt(csv_path, path, delimiter=',', header='x,y', comments='', fmt='%d')
+                logger.info(f"保存曲线{i+1}: {len(path)}个点")
+
+        # 保存debug overlay
+        if len(result['pixel_paths_roi']) > 0:
+            import cv2
+            debug_overlay = result['roi_image'].copy()
+            colors = [(0,255,0), (255,0,0), (0,0,255), (255,255,0), (255,0,255)]
+            for i, path in enumerate(result['pixel_paths_roi']):
+                color = colors[i % len(colors)]
+                for j in range(len(path)-1):
+                    cv2.line(debug_overlay, tuple(path[j]), tuple(path[j+1]), color, 2)
+            save_image(debug_overlay, str(output_path / "debug_overlay.png"))
+
+        # 保存处理信息到log
+        info_lines = [
+            f"图像: {args.image}",
+            f"尺寸: {w}x{h}",
+            f"ROI: {result['roi']}",
+            f"颜色数: {result['stats']['n_colors']}",
+            f"连通域数: {result['stats']['n_components']}",
+            f"最终曲线数: {result['num_curves']}",
+            f"前景像素: {result['stats'].get('foreground_pixels', 'N/A')}"
+        ]
+        for line in info_lines:
+            logger.info(line)
+
+        with open(output_path / "process.log", 'a', encoding='utf-8') as f:
+            f.write('\n' + '='*60 + '\n')
+            f.write('\n'.join(info_lines))
+            f.write('\n' + '='*60 + '\n')
 
         logger.info("=" * 60)
         logger.info("处理完成!")
-        logger.info(f"提取曲线数: {result['num_curves']}")
         logger.info(f"输出目录: {output_path}")
         logger.info("=" * 60)
 
-        print(f"\n✓ 成功提取 {result['num_curves']} 条曲线")
-        print(f"✓ 结果已保存到: {output_path}")
+        print(f"\n[成功] 提取 {result['num_curves']} 条曲线")
+        print(f"[成功] 结果已保存到: {output_path}")
 
     except Exception as e:
         logger.error(f"处理失败: {e}", exc_info=True)
-        print(f"\n✗ 错误: {e}")
+        print(f"\n[错误] {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 

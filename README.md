@@ -1,28 +1,33 @@
-# KM生存曲线提取工具
+# 曲线提取工具
 
-从Kaplan-Meier生存曲线图像中自动提取曲线数据的完整工具。
+从图片中提取带颜色的线，输出像素坐标轨迹。
 
-## 功能特性
+## 功能
 
-- 基于深度学习的曲线分割
-- 自动ROI检测
-- 多曲线追踪和分离
-- KM先验约束（单调性、台阶形状等）
-- 像素坐标到图表坐标映射
-- CSV数据导出
-- 图形界面和命令行双模式
+- 从图片提取彩色曲线
+- 输出像素坐标CSV
+- 支持多条曲线
+- GUI和CLI双模式
 
 ## 安装
 
 ```bash
-# 安装依赖
 pip install -r requirements.txt
-
-# 注意：opencv-contrib-python包含ximgproc模块
-pip install opencv-contrib-python
 ```
 
 ## 使用方法
+
+### CLI模式（推荐）
+
+```bash
+python cli.py --image path/to/image.png
+```
+
+参数：
+- `--image, -i`: 输入图像路径（必需）
+- `--outdir, -o`: 输出目录（默认：outputs）
+- `--n-colors`: 颜色聚类数（默认：5）
+- `--debug`: 启用调试模式
 
 ### GUI模式
 
@@ -31,86 +36,66 @@ python app.py
 ```
 
 操作步骤：
-1. 选择KM曲线图像
-2. 选择模型权重文件（默认：models/best_model.pth）
-3. 设置X轴最大时间
-4. 点击"运行提取"
-5. 查看结果并导出
-
-### CLI模式
-
-```bash
-python cli.py --image path/to/image.png --x-max 48
-```
-
-参数说明：
-- `--image, -i`: 输入图像路径（必需）
-- `--checkpoint, -c`: 模型权重路径（默认：models/best_model.pth）
-- `--outdir, -o`: 输出目录（默认：outputs）
-- `--x-max`: X轴最大时间（默认：48）
-- `--debug`: 启用调试模式，保存中间结果
+1. 选择图像文件
+2. 选择ROI模式（自动/手动/全图）
+3. 点击"运行提取"
+4. 查看结果
 
 ## 输出结果
 
-处理完成后，输出目录包含：
+输出目录包含：
 
-- `original.png`: 原始图像
-- `roi.png`: ROI区域
-- `result.png`: 曲线叠加结果
-- `curve_1.csv`, `curve_2.csv`, ...: 各条曲线坐标
-- `all_curves.csv`: 所有曲线合并
-- `mask_*.png`: 各类别mask（调试模式）
-- `process.log`: 处理日志（调试模式）
+- `roi_crop.png`: ROI区域
+- `mask_color_*.png`: 各颜色mask
+- `mask_component_*.png`: 各连通域mask
+- `result_roi.png`: ROI局部结果
+- `result_global.png`: 全图结果
+- `curve_pixels_*.csv`: 各条曲线像素坐标
+- `debug_overlay.png`: 调试叠加图
+- `process.log`: 处理日志
+
+## 技术路线
+
+1. ROI检测
+2. 深色像素提取
+3. 颜色聚类（LAB空间 + KMeans）
+4. 逐列追踪
+5. 像素坐标输出
 
 ## 项目结构
 
 ```
 KM_2026.3.31/
-├── app.py                  # GUI启动入口
-├── cli.py                  # CLI启动入口
-├── requirements.txt        # 依赖列表
-├── models/
-│   └── best_model.pth     # 训练好的模型
+├── cli.py                  # CLI入口
+├── app.py                  # GUI入口
+├── requirements.txt
 ├── outputs/               # 输出目录
 └── src/
     └── km_app/
-        ├── config.py      # 配置
-        ├── model/         # 模型相关
+        ├── config.py
         ├── pipeline/      # 处理管线
+        │   ├── color_extract.py  # 主提取器
+        │   ├── trace.py
+        │   └── ...
         ├── gui/           # GUI界面
-        ├── io/            # 输入输出
-        └── utils/         # 工具函数
+        └── io/            # 输入输出
 ```
-
-## 技术路线
-
-1. **图像预处理**: 自动ROI检测、归一化
-2. **模型推理**: ResNet风格encoder-decoder分割网络
-3. **后处理**:
-   - 颜色精修和曲线分离
-   - 骨架提取和路径追踪
-   - KM先验约束（单调性、台阶形状）
-4. **坐标映射**: 像素坐标→图表坐标
-5. **结果导出**: CSV格式
 
 ## 注意事项
 
-- 模型输入：3通道RGB图像
-- 模型输出：6类（背景+5条曲线）
-- 推理时会resize到512x512，但最终结果映射回原图
-- KM约束确保曲线符合生存分析规律
+- 默认使用传统图像处理方法，不依赖深度学习模型
+- 输入：RGB图像
+- 输出：像素坐标（x, y）
+- 适用于有明显颜色区分的曲线图
 
 ## 故障排除
 
-### 模型加载失败
-- 检查模型文件路径是否正确
-- 确认模型文件完整未损坏
+### 提取不到曲线
+- 检查图像是否包含明显的深色线条
+- 尝试调整 `--n-colors` 参数
+- 使用GUI手动框选ROI
 
-### 曲线提取不准确
-- 调整X轴最大时间参数
+### 曲线不完整
 - 检查图像质量和分辨率
-- 确保图像包含完整的KM曲线
-
-### GUI无法启动
-- 确认已安装PySide6
-- 检查Python版本（建议3.8+）
+- 确保曲线在ROI范围内
+- 查看 `process.log` 了解详细信息
